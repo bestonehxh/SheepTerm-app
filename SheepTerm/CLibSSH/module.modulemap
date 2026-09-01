@@ -1,0 +1,8 @@
+module CLibSSH [system] {
+    header "/opt/homebrew/include/libssh/libssh.h"
+    // callbacks.h carries ssh_callbacks_struct — needed for the client-side
+    // "auth-agent@openssh.com" channel-open callback (agent forwarding).
+    header "/opt/homebrew/include/libssh/callbacks.h"
+    link "ssh"
+    export *
+}

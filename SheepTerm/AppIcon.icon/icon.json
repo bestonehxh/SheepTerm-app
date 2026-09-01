@@ -1,0 +1,11 @@
+{
+  "fill" : { "linear-gradient" : [ "extended-srgb:0.224,0.267,0.361,1.000", "extended-srgb:0.173,0.208,0.282,1.000" ] },
+  "groups" : [
+    {
+      "layers" : [
+        { "glass" : false, "image-name" : "sheepterm-artwork.png" }
+      ]
+    }
+  ],
+  "supported-platforms" : { "squares" : [ "macOS" ] }
+}
