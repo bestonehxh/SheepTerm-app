@@ -64,10 +64,19 @@ final class LocalTerminalController: NSObject {
         let pid = terminalView.process?.shellPid ?? 0
         // Kill the shell first — closing a tab must not leave an orphaned
         // process holding a pty and eating CPU in the background.
-        if terminalView.process.running {
+        //
+        // Only register a reaper when we ACTUALLY terminated something. On
+        // the ordinary path the shell has already exited and SwiftTerm's
+        // monitor has already waitpid'ed it, but `shellPid` is still set — so
+        // registering anyway attached a DispatchSourceProcess to a pid that
+        // no longer exists. Its exit event never fires, so the source and its
+        // dictionary entry lived in `reapers` for the life of the app, once
+        // per closed local tab.
+        let terminated = terminalView.process.running
+        if terminated {
             terminalView.terminate()
         }
-        if pid > 0 {
+        if terminated, pid > 0 {
             Self.reapAfterTerminate(pid)
         }
         terminalView.processDelegate = nil

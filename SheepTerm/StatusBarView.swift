@@ -17,16 +17,23 @@ struct StatusBarView: View {
     // initializer that every re-render of the parent evaluates.
     @State private var localAddress = ""
     // Hoisted so the publisher isn't recreated on every re-render.
-    private let ipTimer = Timer.publish(every: 15, on: .main, in: .common).autoconnect()
+    /// `static`, not an instance `let`: an instance initializer runs on every
+    /// struct init, so every AppModel publish built a fresh publisher and
+    /// resubscribed — restarting the 15 s phase each time, which a chattier
+    /// model would turn into an IP that never refreshes.
+    private static let ipTimer = Timer.publish(every: 15, on: .main, in: .common).autoconnect()
 
     var body: some View {
         HStack(spacing: 12) {
-            if model.statusShowSession {
-                if let tab = model.selectedTab {
-                    SessionStatusText(tab: tab)
-                } else {
-                    Text("no session")
+            // The connection-state sheep and the highlight vendor control
+            // always show for a remote tab; only the session/cipher/device-IP/
+            // user TEXT is gated by statusShowSession (hidden by default).
+            if let tab = model.selectedTab {
+                SessionStatusText(tab: tab, showText: model.statusShowSession) {
+                    model.setHighlightVendorCurrent($0)
                 }
+            } else if model.statusShowSession {
+                Text("no session")
             }
             Spacer()
             if model.statusShowHints {
@@ -54,7 +61,7 @@ struct StatusBarView: View {
         .onAppear {
             localAddress = NetworkInfo.summary()
         }
-        .onReceive(ipTimer) { _ in
+        .onReceive(Self.ipTimer) { _ in
             // getifaddrs isn't free — skip while the IP segment is hidden or
             // nothing of the app is on screen to show it on.
             guard model.statusShowIP, MainWindowKeyMonitor.shared.isVisible else { return }
@@ -152,6 +159,10 @@ struct SleepingSheepView: View {
 
 struct SessionStatusText: View {
     @ObservedObject var tab: SessionTab
+    /// Whether the session/cipher/device-IP/username line is shown. The
+    /// remote controls (state sheep + vendor picker) show regardless.
+    var showText: Bool = true
+    var onVendorChange: (Vendor) -> Void = { _ in }
 
     private var text: String {
         switch tab.content {
@@ -197,13 +208,14 @@ struct SessionStatusText: View {
 
     var body: some View {
         HStack(spacing: 8) {
-            Text(text)
-                .foregroundStyle(isLegacy ? Theme.warn : Theme.dimText)
-                .lineLimit(1)
+            if showText {
+                Text(text)
+                    .foregroundStyle(isLegacy ? Theme.warn : Theme.dimText)
+                    .lineLimit(1)
+            }
             if isRemote {
                 Button {
-                    tab.highlightEnabled.toggle()
-                    UserDefaults.standard.set(tab.highlightEnabled, forKey: "highlightDefault")
+                    tab.highlightEnabled.toggle() // didSet records the new default
                 } label: {
                     Group {
                         switch connectionState {
@@ -222,6 +234,27 @@ struct SessionStatusText: View {
                 }
                 .buttonStyle(.plain)
                 .help("\(connectionStateText) · Highlight \(tab.highlightEnabled ? "ON" : "OFF") — click to toggle (⌘⇧H)")
+                // The pack this session colours with, and a one-click way to
+                // correct it: a serial console does not announce its vendor,
+                // so the first thing you learn about a box is often that it
+                // is not the one you expected.
+                Menu {
+                    ForEach(Vendor.allCases) { family in
+                        Toggle(family.label, isOn: Binding(
+                            get: { tab.highlightVendor == family },
+                            set: { _ in onVendorChange(family) }
+                        ))
+                    }
+                } label: {
+                    Text(tab.highlightVendor.badge)
+                        .lineLimit(1)
+                }
+                .menuStyle(.borderlessButton)
+                .menuIndicator(.hidden)
+                .fixedSize()
+                .foregroundStyle(Theme.dimText)
+                .opacity(tab.highlightEnabled ? 1 : 0.4)
+                .help("Highlight rules for this session — \(tab.highlightVendor.label)")
             }
         }
     }

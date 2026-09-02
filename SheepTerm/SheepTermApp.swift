@@ -40,7 +40,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// about them either.
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         let live = AppModel.shared.liveRemoteSessions
-        guard !live.isEmpty else { return .terminateNow }
+        guard !live.isEmpty else {
+            AppModel.shared.shutdownSessionsForQuit()
+            return .terminateNow
+        }
 
         let alert = NSAlert()
         alert.alertStyle = .warning
@@ -56,7 +59,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // live session, and Escape maps to it as well.
         quit.keyEquivalent = ""
         cancel.keyEquivalent = "\r"
-        return alert.runModal() == .alertFirstButtonReturn ? .terminateNow : .terminateCancel
+        guard alert.runModal() == .alertFirstButtonReturn else { return .terminateCancel }
+        // Stop and flush BEFORE terminating: the async log close that a tab
+        // close uses never ran when the process simply exited, so the tail
+        // of every open log was lost.
+        AppModel.shared.shutdownSessionsForQuit()
+        return .terminateNow
     }
 }
 
@@ -142,10 +150,6 @@ final class MainWindowKeyMonitor: NSObject, ObservableObject {
 struct SheepTermCommands: Commands {
     @ObservedObject private var model = AppModel.shared
     @ObservedObject private var mainWindowKey = MainWindowKeyMonitor.shared
-    // The supported way to open the SwiftUI Settings scene from a command —
-    // responder-chain showSettingsWindow: silently does nothing when no
-    // Settings window has ever been created.
-    @Environment(\.openSettings) private var openSettings
 
     var body: some Commands {
         // One window only: a second window would share AppModel.shared and
@@ -220,15 +224,17 @@ struct SheepTermCommands: Commands {
                 Label("Toggle Highlighting", systemImage: "highlighter")
             }
             .keyboardShortcut("h", modifiers: [.command, .shift])
-            Button {
-                // Aim the Settings window at the Highlight tab, then open it
-                // via the environment action — works even when no Settings
-                // window exists yet.
-                SettingsTabSelection.shared.tab = .highlight
-                openSettings()
+            Menu {
+                ForEach(Vendor.allCases) { family in
+                    Toggle(family.label, isOn: Binding(
+                        get: { model.selectedTab?.highlightVendor == family },
+                        set: { _ in model.setHighlightVendorCurrent(family) }
+                    ))
+                }
             } label: {
-                Label("Highlight Rules…", systemImage: "slider.horizontal.3")
+                Label("Device Family", systemImage: "cpu")
             }
+            .disabled(model.selectedTab == nil)
             Button {
                 model.clearScrollback()
             } label: {

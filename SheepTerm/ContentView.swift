@@ -51,7 +51,9 @@ struct ContentView: View {
         // Pull the top bar into the titlebar row so the traffic lights and
         // session tabs share one line. Outermost on purpose: a .frame applied
         // after ignoresSafeArea mis-positions the expanded content. Only works
-        // together with the empty NSToolbar attached in syncFullscreen —
+        // together with an empty NSToolbar in an earlier build. That toolbar
+        // is gone and the trick still holds on its own — do not go looking
+        // for code that no longer exists —
         // without a toolbar the titlebar backdrop covers content in this row.
         .ignoresSafeArea(.container, edges: .top)
         .onReceive(NotificationCenter.default.publisher(for: NSWindow.willEnterFullScreenNotification)) { note in
@@ -77,8 +79,7 @@ struct ContentView: View {
     }
 
     private func syncFullscreen(_ window: NSWindow?) {
-        // Only the main window (hiddenTitleBar style) — ignore sheets/panels.
-        guard let window, window.styleMask.contains(.fullSizeContentView) else { return }
+        guard let window, isMainTerminalWindow(window) else { return }
         // didResize fires per frame — write only when the value differs.
         if !window.titlebarAppearsTransparent {
             window.titlebarAppearsTransparent = true
@@ -98,6 +99,15 @@ struct ContentView: View {
 }
 
 /// Hands the hosting NSWindow to SwiftUI as soon as the view lands in one.
+/// For syncFullscreen only (titlebar transparency + background colour, both
+/// harmless on a sheet). The traffic-light spacer must NOT be keyed on this:
+/// a SwiftUI sheet also carries fullSizeContentView and on macOS 26 is
+/// neither an NSSheet nor an NSPanel — TopBarView keys on window identity.
+func isMainTerminalWindow(_ window: NSWindow) -> Bool {
+    window.styleMask.contains(.fullSizeContentView)
+        && !window.isSheet && window.sheetParent == nil && !(window is NSPanel)
+}
+
 private struct WindowSyncAccessor: NSViewRepresentable {
     let onWindow: (NSWindow) -> Void
 
@@ -224,6 +234,13 @@ struct DetailPane: View {
         .sheet(isPresented: $model.showCredentials) {
             CredentialsSheet()
         }
+        // Here and not on SidebarView: the sidebar is removed from the
+        // hierarchy when hidden, and View → Reorder Groups… then set a flag
+        // nobody was presenting — nothing happened, and the sheet popped up
+        // unbidden the next time the sidebar was shown.
+        .sheet(isPresented: $model.showReorderGroups) {
+            ReorderGroupsSheet(store: model.store)
+        }
     }
 }
 
@@ -232,6 +249,13 @@ struct DetailPane: View {
 struct TopBarView: View {
     @EnvironmentObject var model: AppModel
     @State private var isFullScreen = false
+    /// The window this bar lives in. Fullscreen state is read from THIS
+    /// window and healed only from ITS notifications: any test by styleMask
+    /// or class let a SwiftUI sheet (which also carries fullSizeContentView
+    /// and, on macOS 26, is neither an NSSheet nor an NSPanel) pass as the
+    /// main window while it was key, and its styleMask — never .fullScreen —
+    /// put the 64 pt traffic-light spacer back in the middle of fullscreen.
+    @State private var hostWindow: NSWindow?
 
     var body: some View {
         HStack(spacing: 8) {
@@ -276,7 +300,7 @@ struct TopBarView: View {
                     .environmentObject(model)
             }
 
-            TabStripView()
+            TabStripView(compensateWindowBorder: !isFullScreen)
 
             Spacer(minLength: 8)
 
@@ -305,8 +329,21 @@ struct TopBarView: View {
         .background {
             ChromeBackground(zone: .topBar).gesture(WindowDragGesture())
         }
-        .onAppear {
-            isFullScreen = NSApp.keyWindow?.styleMask.contains(.fullScreen) ?? false
+        // Ground truth on attach: a restore straight into fullscreen may skip
+        // the will/did notifications below (§2), and at onAppear the window
+        // is not key yet — so read the styleMask of the window we land in.
+        .background(WindowSyncAccessor { window in
+            DispatchQueue.main.async {
+                hostWindow = window
+                let actual = window.styleMask.contains(.fullScreen)
+                if actual != isFullScreen { isFullScreen = actual }
+            }
+        })
+        .onReceive(NotificationCenter.default.publisher(for: NSWindow.didBecomeKeyNotification)) { note in
+            healFullScreen(from: note)
+        }
+        .onReceive(NotificationCenter.default.publisher(for: NSWindow.didResizeNotification)) { note in
+            healFullScreen(from: note)
         }
         .onReceive(NotificationCenter.default.publisher(for: NSWindow.willEnterFullScreenNotification)) { _ in
             isFullScreen = true
@@ -321,6 +358,19 @@ struct TopBarView: View {
         .onReceive(NotificationCenter.default.publisher(for: NSWindow.didExitFullScreenNotification)) { _ in
             isFullScreen = false
         }
+    }
+}
+
+extension TopBarView {
+    /// The spacer for the traffic lights must match what the window IS, not
+    /// what the last notification said. A restore into fullscreen used to
+    /// leave a 64 pt gap with no buttons behind it until the next toggle.
+    /// Only OUR window counts — see `hostWindow`.
+    private func healFullScreen(from note: Notification) {
+        guard let window = note.object as? NSWindow, let hostWindow, window === hostWindow else { return }
+        let actual = window.styleMask.contains(.fullScreen)
+        // didResize fires per frame — write only when it differs.
+        if actual != isFullScreen { isFullScreen = actual }
     }
 }
 

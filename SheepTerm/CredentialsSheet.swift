@@ -4,6 +4,11 @@ import SwiftUI
 /// Passwords go straight to the Keychain and are never displayed back.
 struct CredentialsSheet: View {
     @EnvironmentObject var model: AppModel
+    /// Observed explicitly: `credentials` is @Published on CredentialStore,
+    /// not on AppModel, so observing `model` alone never redraws this list.
+    /// It looked fine only because every interaction happened to touch some
+    /// local @State as well.
+    @ObservedObject private var credentialStore = AppModel.shared.credentialStore
     @Environment(\.dismiss) private var dismiss
 
     @State private var name = ""
@@ -130,6 +135,8 @@ struct CredentialsSheet: View {
     /// Removes the credential and clears it from every host that
     /// references it, so no host points at a dead Keychain entry.
     private func delete(_ credential: Credential) {
+        // Before the hosts lose the reference — that is how they are found.
+        model.forgetCachedPasswords(forCredential: credential.id)
         model.store.clearCredentialID(credential.id)
         model.credentialStore.remove(credential)
     }

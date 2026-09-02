@@ -27,6 +27,18 @@ struct SidebarView: View {
         return Set(strings.compactMap(UUID.init(uuidString:)))
     }
 
+    /// Shared confirmation for the sidebar's destructive actions. Defaults to
+    /// Cancel so Return does not delete anything.
+    private func confirmDelete(message: String, detail: String) -> Bool {
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = message
+        alert.informativeText = detail
+        alert.addButton(withTitle: "Cancel")
+        alert.addButton(withTitle: "Delete")
+        return alert.runModal() == .alertSecondButtonReturn
+    }
+
     private func persistCollapsed() {
         UserDefaults.standard.set(collapsedGroups.map(\.uuidString), forKey: Self.collapsedKey)
     }
@@ -66,6 +78,15 @@ struct SidebarView: View {
             onReorderGroups: { model.showReorderGroups = true },
             onDeleteGroup: { group in
                 if let original = firstGroup(withID: group.id) {
+                    // Deleting a group takes every host in it. That is the
+                    // largest single loss the sidebar can cause and it had no
+                    // confirmation at all, while deleting one credential did.
+                    guard confirmDelete(
+                        message: "Delete “\(original.name)”?",
+                        detail: original.hosts.isEmpty
+                            ? "The group is empty."
+                            : "\(original.hosts.count) host\(original.hosts.count == 1 ? "" : "s") in it will be deleted too. This cannot be undone."
+                    ) else { return }
                     // Forget its collapsed state too — a stale id would
                     // linger in UserDefaults forever.
                     collapsedGroups.remove(original.id)
@@ -94,7 +115,7 @@ struct SidebarView: View {
         // titlebar safe area and would paint over the tab bar above.
         .background { ChromeBackground(zone: .sidebar) }
         .safeAreaInset(edge: .top, spacing: 0) {
-            // The sidebar sits below the top bar in every mode, so the search
+            // The sidebar is full height in every mode and owns the titlebar row, so the search
             // field keeps the same small top gap everywhere.
             VStack(spacing: 4) {
                 Color.clear.frame(height: topGap)
@@ -153,9 +174,6 @@ struct SidebarView: View {
                     .fill(Theme.chromeLine)
                     .frame(height: 1)
             }
-        }
-        .sheet(isPresented: $model.showReorderGroups) {
-            ReorderGroupsSheet(store: store)
         }
         .sheet(isPresented: $showNewGroup) {
             NamePromptSheet(title: "New Group", confirmLabel: "Create") { name in

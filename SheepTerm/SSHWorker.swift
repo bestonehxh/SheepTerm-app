@@ -31,26 +31,61 @@ nonisolated final class SSHWorker: Sendable {
         var lastError: String?
         /// Write end of the self-pipe; -1 when the loop isn't up.
         var wakeFD: Int32 = -1
+        /// Set when input was discarded because the buffer is full; cleared
+        /// by the next accepted write, so one stall produces one notice.
+        var writeOverflowNotified = false
         var onData: (@Sendable ([UInt8]) -> Void)?
         var onNotice: (@Sendable (String) -> Void)?
+        /// Fired when a write was refused. A paced paste has to stop: the
+        /// pacer counts lines it HANDED OVER, so without this the HUD
+        /// reports a full send while the device got a config with holes.
+        var onInputDiscarded: (@Sendable () -> Void)?
         var onStatus: (@Sendable (String) -> Void)?
         var onClosed: (@Sendable (String) -> Void)?
         var passwordPrompt: (@Sendable (String) -> String?)?
         var challengePrompt: (@Sendable (_ prompt: String, _ secure: Bool) -> String?)?
         var usernamePrompt: (@Sendable (String) -> String?)?
         var onPasswordWorked: (@Sendable (String, String) -> Void)?
+        /// Fired as soon as a username typed at the prompt is known, before
+        /// authentication. Without it the controller's `host` kept an empty
+        /// username for a key-authenticated session, so every reconnect —
+        /// including an unattended automatic one — put the prompt back up.
+        var onUsernameResolved: (@Sendable (String) -> Void)?
+        /// Set when the user dismissed a credential prompt. Reported apart
+        /// from a real authentication failure so auto-reconnect does not
+        /// re-raise the same prompt three times.
+        var authCancelled = false
     }
     private let state = Mutex(State())
     /// Cap on buffered input — a wedged session must not grow it forever.
-    private static let maxPendingWrites = 1024 * 1024
+    ///
+    /// Sized ABOVE the app's own paste limit on purpose. At 1 MB it was
+    /// smaller than `SafePastePlan.maxBytes`, so a legal 2 MB paste — or any
+    /// single-line clipboard over 1 MB, which bypasses Safe Paste entirely —
+    /// was refused whole on a perfectly healthy session and reported as if
+    /// the connection had stalled.
+    private static let maxPendingWrites = SafePastePlan.maxBytes + 1024 * 1024
 
     var onData: (@Sendable ([UInt8]) -> Void)? {
         get { state.withLock { $0.onData } }
         set { state.withLock { $0.onData = newValue } }
     }
+    var onUsernameResolved: (@Sendable (String) -> Void)? {
+        get { state.withLock { $0.onUsernameResolved } }
+        set { state.withLock { $0.onUsernameResolved = newValue } }
+    }
+    private var authCancelled: Bool {
+        get { state.withLock { $0.authCancelled } }
+        set { state.withLock { $0.authCancelled = newValue } }
+    }
     var onNotice: (@Sendable (String) -> Void)? {
         get { state.withLock { $0.onNotice } }
         set { state.withLock { $0.onNotice = newValue } }
+    }
+
+    var onInputDiscarded: (@Sendable () -> Void)? {
+        get { state.withLock { $0.onInputDiscarded } }
+        set { state.withLock { $0.onInputDiscarded = newValue } }
     }
     var onStatus: (@Sendable (String) -> Void)? {
         get { state.withLock { $0.onStatus } }
@@ -105,6 +140,7 @@ nonisolated final class SSHWorker: Sendable {
             state.runActive = true
             state.running = true
             state.pendingWrites.removeAll(keepingCapacity: true)
+            state.writeOverflowNotified = false
             state.pendingResize = nil
             state.lastError = nil
             return true
@@ -133,17 +169,46 @@ nonisolated final class SSHWorker: Sendable {
         }
     }
 
-    func write(_ bytes: [UInt8]) {
+    /// Returns false when the input was refused, so a paced paste can stop
+    /// instead of reporting lines it never sent.
+    @discardableResult
+    func write(_ bytes: [UInt8]) -> Bool {
+        // Fired outside the lock: onNotice hops to the main actor, and this
+        // Mutex is not recursive.
+        var notice: (@Sendable (String) -> Void)?
+        var message = ""
+        var accepted = false
+        var discarded: (@Sendable () -> Void)?
         state.withLock { state in
             guard state.running else { return }
-            let room = Self.maxPendingWrites - state.pendingWrites.count
-            guard room > 0 else { return }
-            state.pendingWrites.append(contentsOf: bytes.prefix(room))
+            // All-or-nothing. The old code appended `bytes.prefix(room)`,
+            // which on a wedged session sent the FRONT of a paste and threw
+            // the rest away — half an escape sequence or half a config line
+            // reaching the device is worse than nothing reaching it.
+            guard state.pendingWrites.count + bytes.count <= Self.maxPendingWrites else {
+                discarded = state.onInputDiscarded
+                if !state.writeOverflowNotified {
+                    state.writeOverflowNotified = true
+                    notice = state.onNotice
+                    // Two different failures wear one message otherwise, and
+                    // the wrong one sends you debugging a healthy link.
+                    message = bytes.count > Self.maxPendingWrites
+                        ? "that paste is larger than SheepTerm will send in one go — nothing was sent"
+                        : "connection is not draining — input is being discarded until it recovers"
+                }
+                return
+            }
+            state.writeOverflowNotified = false
+            state.pendingWrites.append(contentsOf: bytes)
+            accepted = true
             if state.wakeFD >= 0 {
                 var byte: UInt8 = 0
                 _ = Darwin.write(state.wakeFD, &byte, 1)
             }
         }
+        if let notice { notice(message) }
+        discarded?()
+        return accepted
     }
 
     func resize(cols: Int, rows: Int) {
@@ -219,6 +284,7 @@ nonisolated final class SSHWorker: Sendable {
                 return
             }
             config.username = user
+            onUsernameResolved?(user)
         }
 
         // libssh keeps the pointer we hand ssh_set_callbacks, so the
@@ -254,10 +320,15 @@ nonisolated final class SSHWorker: Sendable {
         // The tab may have been closed while the (blocking) connect ran.
         guard isRunning else { return }
         guard verifyHostKey(session) else { return }
+        authCancelled = false
         guard authenticate(session, config) else {
             // Only a live session reports failure — a tab closed mid-auth
-            // must not print a fake "authentication failed".
-            if isRunning { onClosed?("authentication failed") }
+            // must not print a fake "authentication failed". A prompt the
+            // user dismissed is reported as a cancellation: the controller
+            // turns that into a status auto-reconnect leaves alone.
+            if isRunning {
+                onClosed?(authCancelled ? "connection cancelled — no password given" : "authentication failed")
+            }
             return
         }
 
@@ -285,7 +356,17 @@ nonisolated final class SSHWorker: Sendable {
         }
         // Runs before the session teardown above (defers unwind in reverse),
         // which is required: the channels are freed against a live session.
-        defer { forwarder?.closeAll() }
+        // It is also the LAST use of `forwarder`, after which ARC may free
+        // it — while libssh still holds its userdata pointer until ssh_free.
+        // Detach the callback first so a packet processed during teardown
+        // cannot call into a released object.
+        defer {
+            if forwarder != nil {
+                callbacks.pointee.channel_open_request_auth_agent_function = nil
+                _ = ssh_set_callbacks(session, callbacks)
+            }
+            forwarder?.closeAll()
+        }
 
         guard let channel = ssh_channel_new(session) else {
             onClosed?("could not allocate channel")
@@ -426,7 +507,12 @@ nonisolated final class SSHWorker: Sendable {
                         var delivered = false
                         repeat {
                             delivered = false
-                            if readAvailable(session: session, channel: channel, buffer: &buffer, delivered: &delivered) != nil { break }
+                            // A read error here is not a clean close — the
+                            // file's own rule, previously dropped on this path.
+                            if let failure = readAvailable(session: session, channel: channel, buffer: &buffer, delivered: &delivered) {
+                                requeueWrites(writes[offset...])
+                                return failure
+                            }
                         } while delivered
                         return nil
                     }
@@ -484,8 +570,13 @@ nonisolated final class SSHWorker: Sendable {
             if let resize = takeResize() {
                 // SSH_AGAIN is not an error — retry the same resize on the
                 // next pass instead of dropping it.
-                if ssh_channel_change_pty_size(channel, Int32(resize.cols), Int32(resize.rows)) == SSH_AGAIN {
+                let rc = ssh_channel_change_pty_size(channel, Int32(resize.cols), Int32(resize.rows))
+                if rc == SSH_AGAIN {
                     requeueResize(resize)
+                } else if rc != SSH_OK {
+                    // Anything else means the pty keeps the old size and
+                    // output wraps wrong until the next resize — silently.
+                    onNotice?("could not resize the remote terminal: \(errorString(session))")
                 }
             }
 
@@ -678,7 +769,10 @@ nonisolated final class SSHWorker: Sendable {
             guard isRunning else { return false }
             if password == nil || password?.isEmpty == true {
                 password = passwordPrompt?("Password for \(config.username)@\(config.host)")
-                guard let entered = password, !entered.isEmpty else { return false }
+                guard let entered = password, !entered.isEmpty else {
+                    authCancelled = true
+                    return false
+                }
             }
             guard let currentPassword = password else { return false }
 
@@ -691,6 +785,9 @@ nonisolated final class SSHWorker: Sendable {
             }
 
             // Old network gear + TACACS very often use keyboard-interactive.
+            // Whether the cached password — not a typed challenge answer — is what
+            // satisfied the exchange.
+            var usedCachedPassword = false
             var interactive = ssh_userauth_kbdint(session, nil, nil)
             while interactive == AUTH_INFO {
                 // The tab may have closed while prompts were answered.
@@ -717,11 +814,15 @@ nonisolated final class SSHWorker: Sendable {
                     let answer: String
                     if canReusePassword {
                         answer = currentPassword
+                        usedCachedPassword = true
                     } else {
                         let display = prompt.isEmpty
                             ? "Authentication challenge for \(config.username)@\(config.host)"
                             : prompt
-                        guard let entered = challengePrompt?(display, echo == 0) else { return false }
+                        guard let entered = challengePrompt?(display, echo == 0) else {
+                            authCancelled = true
+                            return false
+                        }
                         answer = entered
                     }
                     let answerResult = answer.withCString {
@@ -735,7 +836,13 @@ nonisolated final class SSHWorker: Sendable {
                 interactive = ssh_userauth_kbdint(session, nil, nil)
             }
             if interactive == AUTH_SUCCESS {
-                onPasswordWorked?(config.username, currentPassword)
+                // Only report the password when it is what actually answered.
+                // A denied password followed by a successful OTP challenge
+                // used to cache the DENIED password, so the next reconnect
+                // tried a known-bad one first and burned a server attempt.
+                if usedCachedPassword {
+                    onPasswordWorked?(config.username, currentPassword)
+                }
                 return true
             }
 

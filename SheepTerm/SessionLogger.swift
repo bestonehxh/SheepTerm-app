@@ -111,6 +111,9 @@ nonisolated final class SessionLogger: Sendable {
     /// blocking thread to be woken *by* the drain, not just to read a
     /// number: a `Mutex` has no wait/signal.
     private let pendingCondition = NSCondition()
+    /// Set after the first failed write, so a full disk produces one line in
+    /// the system log rather than one per chunk forever.
+    private let writeFailureReported = Mutex(false)
     /// `nonisolated(unsafe)`: mutated only while `pendingCondition`'s own
     /// lock is held (in `waitForRoom`/`addPending`/`removePending`) — an
     /// external synchronization primitive the compiler can't see, the same
@@ -188,6 +191,17 @@ nonisolated final class SessionLogger: Sendable {
         pendingCondition.unlock()
     }
 
+    private func reportWriteFailureOnce(_ error: Error) {
+        let first = writeFailureReported.withLock { reported -> Bool in
+            guard !reported else { return false }
+            reported = true
+            return true
+        }
+        guard first else { return }
+        NSLog("SheepTerm: session log %@ stopped accepting writes (%@) — it no longer matches the session",
+              url.lastPathComponent, error.localizedDescription)
+    }
+
     func append(_ bytes: [UInt8]) {
         // Backpressure gate, deliberately outside `state`'s Mutex: if this
         // blocks, `close()` must still be free to run (it needs `state`,
@@ -244,7 +258,14 @@ nonisolated final class SessionLogger: Sendable {
             state.written += chunk.count
             addPending(chunk.count)
             ioQueue.async { [self] in
-                try? handle.write(contentsOf: chunk)
+                do {
+                    try handle.write(contentsOf: chunk)
+                } catch {
+                    // A swallowed write means the log quietly stops matching
+                    // the wire — a disk that filled up looks exactly like a
+                    // quiet session. Say it once per file, not per chunk.
+                    reportWriteFailureOnce(error)
+                }
                 removePending(chunk.count)
             }
         }

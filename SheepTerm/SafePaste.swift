@@ -43,6 +43,9 @@ nonisolated struct SafePastePlan: Equatable, Sendable {
         var idx = utf8.startIndex
         while idx < utf8.endIndex {
             let byte = utf8[idx]
+            // Refuse as soon as the cap is passed, not after every line of a
+            // 5 MB clipboard has been materialised on the main actor.
+            if lines.count > maxLines { throw ParseError.tooManyLines }
             if byte == 0x0D {
                 lines.append(String(decoding: utf8[start..<idx], as: UTF8.self))
                 var next = utf8.index(after: idx)
@@ -83,6 +86,9 @@ final class SafePastePacer {
         case keyboardInput
         case sessionEnded
         case replaced
+        /// The transport refused the line — the device did NOT receive it,
+        /// so the run must not be reported as finished.
+        case inputDiscarded
     }
 
     private var task: Task<Void, Never>?
@@ -128,7 +134,11 @@ final class SafePastePacer {
         task = nil
         let callback = completion
         completion = nil
-        callback?(reason, sentCount)
+        // sentCount counts lines HANDED to the transport. A refusal is
+        // reported synchronously from inside that hand-over, so the refused
+        // line is always the last one counted — and the device never got it.
+        let delivered = reason == .inputDiscarded ? max(sentCount - 1, 0) : sentCount
+        callback?(reason, delivered)
     }
 
     private func finish(reason: EndReason) {

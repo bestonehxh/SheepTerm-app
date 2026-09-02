@@ -215,6 +215,33 @@ final class ScrollerFader {
 }
 
 final class SheepSSHTerminalView: TerminalView {
+    /// SwiftTerm's `TerminalOptions.default` caps scrollback at 500 lines,
+    /// and `init(frame:)` takes that default — which is far too little for
+    /// the output this app exists to read. `display current-configuration`
+    /// on the Huawei core in the sample logs is 1,854 lines; a Cisco `show
+    /// tech-support` runs into five figures. Scrolling back to the top of
+    /// one of those is the whole point of having scrollback at all.
+    ///
+    /// Cost is bounded and linear — lines x columns x ~24 bytes per cell —
+    /// and only paid for lines actually produced, so a quiet session costs
+    /// nothing and a 200-column tab that really emits 10,000 lines costs
+    /// roughly 48 MB. Override with the `scrollbackLines` user default if
+    /// that is the wrong trade on a given machine.
+    static var scrollbackLines: Int {
+        let saved = UserDefaults.standard.integer(forKey: "scrollbackLines")
+        return saved > 0 ? min(max(saved, 500), 200_000) : 10_000
+    }
+
+    override init(frame: CGRect) {
+        var options = TerminalOptions.default
+        options.scrollback = Self.scrollbackLines
+        super.init(frame: frame, font: nil, options: options)
+    }
+
+    required init?(coder: NSCoder) {
+        super.init(coder: coder)
+    }
+
     private let scrollerFader = ScrollerFader()
     private let pastePacer = SafePastePacer()
     private var pastePromptPresented = false
@@ -407,10 +434,36 @@ final class SheepSSHTerminalView: TerminalView {
             progress: { [weak self] sent, total in
                 self?.showPasteHUD(sent: sent, total: total, delayMilliseconds: delayMilliseconds)
             },
-            completion: { [weak self] _, _ in
-                self?.hidePasteHUD()
+            completion: { [weak self] reason, sent in
+                guard let self else { return }
+                self.hidePasteHUD()
+                // A paste that was cut short must SAY so. The pacer counts
+                // lines it handed to the transport, so a silent stop left the
+                // HUD reporting a complete send while the device had received
+                // a config with holes in the middle.
+                // The same goes for a session that ended or a tab switched
+                // away mid-paste: the switch is half-configured either way.
+                if reason == .inputDiscarded || (reason == .sessionEnded && sent < plan.lines.count) {
+                    self.reportPasteInterrupted(sent: sent, total: plan.lines.count, reason: reason)
+                }
             }
         )
+    }
+
+    private func reportPasteInterrupted(sent: Int, total: Int, reason: SafePastePacer.EndReason) {
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "Paste stopped part-way"
+        let cause = reason == .inputDiscarded
+            ? "The session stopped accepting input"
+            : "The session ended or the tab was switched away"
+        alert.informativeText = """
+            \(cause) after \(sent) of \(total) lines, \
+            so the rest was not sent. Check what actually reached the device \
+            before pasting the remainder.
+            """
+        alert.addButton(withTitle: "OK")
+        alert.runModal()
     }
 
     /// Bracketed-paste markers: `ESC [ 200 ~` / `ESC [ 201 ~`.
@@ -545,6 +598,18 @@ final class SheepSSHTerminalView: TerminalView {
 }
 
 final class SheepLocalTerminalView: LocalProcessTerminalView {
+    // Same 500-line default, same reason to raise it — see
+    // SheepSSHTerminalView.scrollbackLines.
+    override init(frame: CGRect) {
+        var options = TerminalOptions.default
+        options.scrollback = SheepSSHTerminalView.scrollbackLines
+        super.init(frame: frame, font: nil, options: options)
+    }
+
+    required init?(coder: NSCoder) {
+        super.init(coder: coder)
+    }
+
     private let scrollerFader = ScrollerFader()
 
     override func viewDidMoveToWindow() {

@@ -319,8 +319,7 @@ final class SidebarOutlineCoordinator: NSObject, NSOutlineViewDataSource, NSOutl
         guard !text.isEmpty else { return parent.store.groups }
         return parent.store.groups.compactMap { group in
             let hosts = group.hosts.filter {
-                $0.name.localizedCaseInsensitiveContains(text)
-                    || $0.address.localizedCaseInsensitiveContains(text)
+                $0.name.matchesSearch(text) || $0.address.matchesSearch(text)
             }
             return hosts.isEmpty ? nil : HostGroup(id: group.id, name: group.name, hosts: hosts)
         }
@@ -328,6 +327,17 @@ final class SidebarOutlineCoordinator: NSObject, NSOutlineViewDataSource, NSOutl
 
     /// Root rows above the groups — they never take part in a drag.
     private var fixedSectionCount = 0
+
+    /// Everything rebuild() reads. Comparing this is what lets an unrelated
+    /// publish cost nothing.
+    private struct InputStamp: Equatable {
+        var revision: Int
+        var search: String
+        var showRecents: Bool
+        var recentsShown: Int
+        var collapsed: Set<UUID>
+    }
+    private var lastStamp: InputStamp?
 
     private func buildRoots() -> [SidebarItem] {
         var result: [SidebarItem] = []
@@ -403,6 +413,18 @@ final class SidebarOutlineCoordinator: NSObject, NSOutlineViewDataSource, NSOutl
 
     func rebuild(force: Bool) {
         guard let outline else { return }
+        // Cheap gate first. buildRoots() allocates a SidebarItem per node and
+        // currentSignature() joins a String from every row — at 2,000 hosts
+        // that is ~2.3 ms and ~75 KB of garbage, and updateNSView runs on
+        // EVERY AppModel publish, so a divider drag paid it per frame.
+        let stamp = InputStamp(revision: parent.store.revision,
+                               search: parent.searchText,
+                               showRecents: parent.showRecents,
+                               recentsShown: parent.recentsShown,
+                               collapsed: parent.collapsedGroups)
+        if !force, stamp == lastStamp { return }
+        lastStamp = stamp
+
         let fresh = buildRoots()
         let newSignature = currentSignature(fresh)
         guard force || newSignature != signature else {
@@ -678,7 +700,17 @@ final class SidebarOutlineCoordinator: NSObject, NSOutlineViewDataSource, NSOutl
             moveItem.submenu = submenu
             menu.addItem(moveItem)
             menu.addItem(.separator())
-            add(menu, "Remove Host") { [weak self] in self?.parent.store.removeHost(host) }
+            add(menu, "Remove Host") { [weak self] in
+                guard let self else { return }
+                let alert = NSAlert()
+                alert.alertStyle = .warning
+                alert.messageText = "Remove “\(host.name)”?"
+                alert.informativeText = "This cannot be undone. Saved credentials are not affected."
+                alert.addButton(withTitle: "Cancel")   // default, so Return cancels
+                alert.addButton(withTitle: "Remove")
+                guard alert.runModal() == .alertSecondButtonReturn else { return }
+                self.parent.store.removeHost(host)
+            }
         case .staticRow:
             guard let host = node.host else { return nil }
             add(menu, "Connect") { [weak self] in
@@ -785,13 +817,26 @@ final class SidebarOutlineCoordinator: NSObject, NSOutlineViewDataSource, NSOutl
 
 /// NSMenuItem that runs a closure — the sidebar's menus are built on the fly
 /// from the row that was right-clicked.
+///
+/// The closure lives on a small separate target, NOT on the item itself.
+/// NSMenuItem holds its `target` strongly, so `target = self` made every item
+/// retain itself: the items outlived their menu forever, and each one holds a
+/// captured Host or HostGroup. Every right-click leaked the whole menu.
 private final class MenuAction: NSMenuItem {
-    private let run: () -> Void
+    /// Owned by the item through `representedObject`, and referenced by it as
+    /// `target` — the item holds the trampoline, the trampoline holds only
+    /// the closure, so the pair dies with the menu.
+    private final class Trampoline: NSObject {
+        let run: () -> Void
+        init(run: @escaping () -> Void) { self.run = run }
+        @objc func fire() { run() }
+    }
 
     init(title: String, run: @escaping () -> Void) {
-        self.run = run
-        super.init(title: title, action: #selector(fire), keyEquivalent: "")
-        target = self
+        let trampoline = Trampoline(run: run)
+        super.init(title: title, action: #selector(Trampoline.fire), keyEquivalent: "")
+        target = trampoline
+        representedObject = trampoline
     }
 
     // NSMenuItem's designated inits are nonisolated; silence the
@@ -801,6 +846,4 @@ private final class MenuAction: NSMenuItem {
     }
 
     nonisolated required init(coder: NSCoder) { fatalError("not used") }
-
-    @objc private func fire() { run() }
 }

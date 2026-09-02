@@ -87,29 +87,13 @@ final class LibraryUpdateChecker: ObservableObject {
     }
 }
 
-/// Which Settings tab is showing — shared so menu commands can aim the
-/// window at a specific tab (Highlight Rules… always lands on Highlight,
-/// even if the window was left on General).
-@MainActor
-final class SettingsTabSelection: ObservableObject {
-    static let shared = SettingsTabSelection()
-    enum Tab { case general, highlight }
-    @Published var tab: Tab = .general
-}
-
+/// Settings (⌘,). Highlight rules are fixed built-ins now, so the window has
+/// only the one pane — the app icon, chrome, sidebar, connection, backup and
+/// library sections.
 struct SettingsView: View {
-    @ObservedObject private var selection = SettingsTabSelection.shared
-
     var body: some View {
-        TabView(selection: $selection.tab) {
-            GeneralSettingsView()
-                .tabItem { Label("General", systemImage: "gearshape") }
-                .tag(SettingsTabSelection.Tab.general)
-            HighlightSettingsView()
-                .tabItem { Label("Highlight", systemImage: "highlighter") }
-                .tag(SettingsTabSelection.Tab.highlight)
-        }
-        .frame(width: 700, height: 500)
+        GeneralSettingsView()
+            .frame(width: 700, height: 500)
     }
 }
 
@@ -253,7 +237,7 @@ struct GeneralSettingsView: View {
                         Label("Restore…", systemImage: "arrow.up.doc")
                     }
                 }
-                Text("One file with every group and host, the Recent list, highlight rules, credential names and all app settings. Passwords are never included — they stay in this Mac's Keychain. Restoring replaces the current configuration and copies it aside first.")
+                Text("One file with every group and host, the Recent list, credential names and all app settings. Passwords are never included — they stay in this Mac's Keychain. Restoring replaces the current configuration and copies it aside first.")
                     .font(.system(size: 11))
                     .foregroundStyle(.secondary)
             }
@@ -300,92 +284,5 @@ struct GeneralSettingsView: View {
         .onChange(of: customIconStamp) {
             customIcon = NSImage(contentsOf: AppModel.customIconURL)
         }
-    }
-}
-
-/// Settings (⌘,) — configure the optimized built-in highlight rules.
-struct HighlightSettingsView: View {
-    @ObservedObject private var store = AppModel.shared.highlightStore
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            VStack(alignment: .leading, spacing: 3) {
-                Text("Highlight Rules")
-                    .font(.headline)
-                Text("Optimized built-in rules only. Enable, recolor, make bold, or reorder them; changes apply to new output immediately.")
-                    .font(.system(size: 11))
-                    .foregroundStyle(.secondary)
-            }
-            .padding(16)
-
-            List {
-                ForEach($store.configs) { $config in
-                    HighlightRuleRow(config: $config)
-                }
-                .onMove { from, to in
-                    store.configs.move(fromOffsets: from, toOffset: to)
-                }
-            }
-
-            HStack {
-                Spacer()
-                Button("Reset to Defaults") {
-                    store.resetToDefaults()
-                }
-            }
-            .padding(12)
-        }
-    }
-}
-
-struct HighlightRuleRow: View {
-    @Binding var config: HighlightRuleConfig
-
-    var body: some View {
-        HStack(spacing: 8) {
-            Toggle("", isOn: $config.enabled)
-                .labelsHidden()
-                .toggleStyle(.checkbox)
-                .help("Enable rule")
-            VStack(alignment: .leading, spacing: 2) {
-                Text(config.name)
-                    .font(.system(size: 12, weight: .medium))
-                Text("Built-in scanner")
-                    .font(.system(size: 10))
-                    .foregroundStyle(.secondary)
-            }
-            .frame(maxWidth: .infinity, alignment: .leading)
-            ColorPicker("", selection: colorBinding, supportsOpacity: false)
-                .labelsHidden()
-                .frame(width: 34)
-            Toggle("B", isOn: $config.bold)
-                .toggleStyle(.checkbox)
-                .font(.system(size: 11, weight: .bold))
-                .help("Bold")
-        }
-        .padding(.vertical, 2)
-        .opacity(config.enabled ? 1 : 0.5)
-    }
-
-    private var colorBinding: Binding<Color> {
-        Binding(
-            get: {
-                let hex = UInt32(config.colorHex, radix: 16) ?? 0xFFFFFF
-                return Color(
-                    red: Double((hex >> 16) & 0xFF) / 255,
-                    green: Double((hex >> 8) & 0xFF) / 255,
-                    blue: Double(hex & 0xFF) / 255
-                )
-            },
-            set: { newColor in
-                guard let rgb = NSColor(newColor).usingColorSpace(.sRGB) else { return }
-                config.colorHex = String(
-                    format: "%02X%02X%02X",
-                    Int(rgb.redComponent * 255),
-                    Int(rgb.greenComponent * 255),
-                    Int(rgb.blueComponent * 255)
-                )
-            }
-        )
     }
 }

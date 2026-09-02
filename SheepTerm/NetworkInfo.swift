@@ -44,10 +44,11 @@ enum NetworkInfo {
             guard status == 0 else { continue }
             let ipBytes = host.prefix { $0 != 0 }.map(UInt8.init(bitPattern:))
             let ip = String(decoding: ipBytes, as: UTF8.self)
-            if name == "en0" { return (ip, name) }
             // utun* are VPN tunnels and 169.254.x is link-local — neither is
-            // a useful "This Mac" fallback.
+            // a useful "This Mac" address, en0 included: an en0 that is up
+            // without a lease must not shadow a real address elsewhere.
             guard !name.hasPrefix("utun"), !ip.hasPrefix("169.254.") else { continue }
+            if name == "en0" { return (ip, name) }
             if fallback == nil { fallback = (ip, name) }
         }
         return fallback

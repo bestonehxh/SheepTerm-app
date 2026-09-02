@@ -2,15 +2,16 @@ import AppKit
 import UniformTypeIdentifiers
 
 /// One-file backup of a whole SheepTerm configuration: every group and
-/// host, the recents list, highlight rules, credential *metadata*, the
-/// custom icon, and the app's settings.
+/// host, the recents list, credential *metadata*, the custom icon, and the
+/// app's settings.
 ///
 /// **Passwords are deliberately not in it.** They live only in the macOS
 /// Keychain (service `Bestchaan.SheepTerm`) and a backup file is meant to
 /// be copied around — putting them in would turn every backup into a
-/// plaintext password store. After restoring on another Mac, SheepTerm
-/// asks for the password once per credential and puts it in that Mac's own
-/// Keychain.
+/// plaintext password store. After restoring on another Mac, SheepTerm has
+/// no password for those credentials and prompts on EVERY connection: there
+/// is no path that stores a password typed at a connect prompt. Re-entering
+/// the credential in Settings is what puts it in that Mac's Keychain.
 @MainActor
 enum BackupManager {
     static let fileExtension = "sheeptermbackup"
@@ -21,7 +22,7 @@ enum BackupManager {
     /// A missing one is normal (no custom icon, no credentials yet) and is
     /// simply left out of the backup.
     private static let fileNames = [
-        "hosts.json", "recents.json", "highlight-rules.json",
+        "hosts.json", "recents.json",
         "credentials.json", "custom-icon.png",
     ]
 
@@ -132,29 +133,7 @@ enum BackupManager {
             if let data = try? Data(contentsOf: url) { files[name] = data }
         }
 
-        var settings: [String: Setting] = [:]
-        let defaults = UserDefaults.standard
-        for key in settingKeys {
-            guard let object = defaults.object(forKey: key) else { continue }
-            switch object {
-            // NSNumber is Bool, Int and Double all at once, so ask the
-            // number itself which one it actually holds.
-            case let number as NSNumber:
-                if CFGetTypeID(number) == CFBooleanGetTypeID() {
-                    settings[key] = .bool(number.boolValue)
-                } else if CFNumberIsFloatType(number) {
-                    settings[key] = .double(number.doubleValue)
-                } else {
-                    settings[key] = .int(number.intValue)
-                }
-            case let text as String:
-                settings[key] = .string(text)
-            case let list as [String]:
-                settings[key] = .strings(list)
-            default:
-                continue
-            }
-        }
+        let settings = currentSettings()
 
         let version = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "?"
         let build = Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "?"
@@ -175,7 +154,7 @@ enum BackupManager {
             panel.allowedContentTypes = [type]
         }
         panel.nameFieldStringValue = "SheepTerm-\(fileStamp("yyyy-MM-dd")).\(fileExtension)"
-        panel.message = "Groups, hosts, highlight rules and settings. Passwords stay in your Keychain and are not included."
+        panel.message = "Groups, hosts and settings. Passwords stay in your Keychain and are not included."
         guard panel.runModal() == .OK, let url = panel.url else { return }
 
         let encoder = JSONEncoder()
@@ -230,9 +209,11 @@ enum BackupManager {
             \(payload.groupCount) groups, \(payload.hostCount) hosts.
 
             This replaces every group, host and setting in SheepTerm. Your current \
-            configuration is copied aside first, so nothing is lost for good. \
-            Passwords are not part of a backup — they stay in the Keychain of the \
-            Mac they were saved on.
+            hosts, credentials list and settings are copied aside \
+            first, so nothing is lost for good. Passwords are not part of a backup — \
+            they stay in the Keychain of the Mac they were saved on, so a credential \
+            restored from another Mac will ask for its password on every connection \
+            until you re-enter it in Settings.
             """
         alert.alertStyle = .warning
         alert.addButton(withTitle: "Restore")
@@ -255,6 +236,37 @@ enum BackupManager {
         }
     }
 
+
+    /// The app's settings as the payload stores them. Shared by the backup
+    /// itself and by the pre-restore snapshot, which has to capture the same
+    /// thing a restore can overwrite.
+    private static func currentSettings() -> [String: Setting] {
+        var settings: [String: Setting] = [:]
+        let defaults = UserDefaults.standard
+        for key in settingKeys {
+            guard let object = defaults.object(forKey: key) else { continue }
+            switch object {
+            // NSNumber is Bool, Int and Double all at once, so ask the
+            // number itself which one it actually holds.
+            case let number as NSNumber:
+                if CFGetTypeID(number) == CFBooleanGetTypeID() {
+                    settings[key] = .bool(number.boolValue)
+                } else if CFNumberIsFloatType(number) {
+                    settings[key] = .double(number.doubleValue)
+                } else {
+                    settings[key] = .int(number.intValue)
+                }
+            case let text as String:
+                settings[key] = .string(text)
+            case let list as [String]:
+                settings[key] = .strings(list)
+            default:
+                continue
+            }
+        }
+        return settings
+    }
+
     /// Copies the current configuration into a dated folder before a
     /// restore overwrites it. Returns the folder, or nil when there was
     /// nothing to copy.
@@ -268,8 +280,32 @@ enum BackupManager {
             if !copied {
                 try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
             }
-            try? FileManager.default.copyItem(at: source, to: folder.appendingPathComponent(name))
-            copied = true
+            // Only a copy that LANDED counts. `copied = true` regardless
+            // meant a second restore in the same second — same folder name,
+            // every copy refused with "file exists" — still told the user
+            // their previous configuration was safely in that folder.
+            do {
+                try FileManager.default.copyItem(at: source, to: folder.appendingPathComponent(name))
+                copied = true
+            } catch {
+                NSLog("SheepTerm: pre-restore copy of %@ failed: %@", name, error.localizedDescription)
+            }
+        }
+        // Settings are part of what a restore overwrites, so they are part of
+        // what "copied aside first, so nothing is lost for good" has to mean.
+        // Written in the same shape a payload uses, so it can be restored by
+        // importing this folder's file like any other backup.
+        let settings = currentSettings()
+        if !settings.isEmpty {
+            if !copied {
+                try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+            }
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+            if let data = try? encoder.encode(settings) {
+                try? data.write(to: folder.appendingPathComponent("settings.json"), options: .atomic)
+                copied = true
+            }
         }
         return copied ? folder : nil
     }
@@ -290,9 +326,12 @@ enum BackupManager {
         for key in settingKeys {
             if let setting = payload.settings[key] {
                 defaults.set(setting.objectValue, forKey: key)
-            } else {
-                defaults.removeObject(forKey: key)
             }
+            // A key the payload does not carry is LEFT ALONE. Clearing it
+            // meant restoring a backup taken before a setting existed reset
+            // that setting to its default — and since the pre-restore
+            // snapshot only copies files, never UserDefaults, there was
+            // nothing to undo it with. A backup restores what it contains.
         }
     }
 

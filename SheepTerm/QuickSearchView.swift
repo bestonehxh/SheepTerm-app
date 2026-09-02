@@ -11,13 +11,15 @@ struct QuickSearchView: View {
         ConnectParser.parse(text)
     }
 
-    private var matches: [Host] {
+    /// Computed ONCE per body evaluation. It used to be read twice — for the
+    /// isEmpty check and for the ForEach — so every keystroke ran the
+    /// locale-aware filter over every host twice.
+    private var matches: [Host] { computeMatches() }
+
+    private func computeMatches() -> [Host] {
         var all = model.store.recents + model.store.groups.flatMap(\.hosts)
         if !text.isEmpty {
-            all = all.filter {
-                $0.name.localizedCaseInsensitiveContains(text)
-                    || $0.address.localizedCaseInsensitiveContains(text)
-            }
+            all = all.filter { $0.name.matchesSearch(text) || $0.address.matchesSearch(text) }
         }
         var seen = Set<String>()
         var unique: [Host] = []
@@ -32,6 +34,7 @@ struct QuickSearchView: View {
     }
 
     var body: some View {
+        let results = matches
         VStack(alignment: .leading, spacing: 8) {
             HStack(spacing: 6) {
                 Image(systemName: "magnifyingglass")
@@ -60,9 +63,9 @@ struct QuickSearchView: View {
                 }
             }
 
-            if !matches.isEmpty {
+            if !results.isEmpty {
                 Divider()
-                ForEach(matches) { host in
+                ForEach(results) { host in
                     paletteRow(
                         badge: host.kind.badge,
                         badgeColor: host.kind == .serial ? Theme.warn : Theme.accent,

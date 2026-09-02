@@ -22,7 +22,18 @@ enum ShareCodec {
     }
 
     static func decode(_ data: Data) throws -> SharePayload {
-        try JSONDecoder().decode(SharePayload.self, from: data)
+        var payload = try JSONDecoder().decode(SharePayload.self, from: data)
+        // Strip on the way IN as well. encode() drops credentialID, but a
+        // hand-edited or third-party file can carry one, and an imported host
+        // that points at a local credential would connect with a password the
+        // sender never had. "Credentials never travel" has to be true of the
+        // files we read, not only the ones we write.
+        payload.group.hosts = payload.group.hosts.map { host in
+            var copy = host
+            copy.credentialID = nil
+            return copy
+        }
+        return payload
     }
 
     static var deviceName: String {

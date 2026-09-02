@@ -8,6 +8,11 @@ struct QuickConnectSheet: View {
     let kind: ConnectionKind
 
     @EnvironmentObject var model: AppModel
+    /// Observed explicitly: `credentials` is @Published on CredentialStore,
+    /// not on AppModel, so observing `model` alone never redraws this list.
+    /// It looked fine only because every interaction happened to touch some
+    /// local @State as well.
+    @ObservedObject private var credentialStore = AppModel.shared.credentialStore
     @Environment(\.dismiss) private var dismiss
 
     // Connection
@@ -23,10 +28,13 @@ struct QuickConnectSheet: View {
     @State private var credentialName = ""
     @State private var cipherMode: CipherMode = .auto
     @State private var agentForward = false
+    /// Highlight device family. `.auto` leaves passive stream detection ON; a
+    /// specific pick is a manual/saved choice, so detection is off for it.
+    @State private var vendor: Vendor = .auto
 
     // Serial
     @State private var device = ""
-    @State private var baud = 115200
+    @State private var baud = Self.defaultBaud
     @State private var devices: [String] = []
 
     // Save session — off by default: Recent already remembers ad-hoc
@@ -39,6 +47,9 @@ struct QuickConnectSheet: View {
     private static let defaultGroup = "Quick Connect"
     private static let newGroupTag = "\u{0}new-group"
     private static let baudRates = [9600, 19200, 38400, 57600, 115200, 230400]
+    /// Console ports on network gear are 9600 8N1 out of the box — Cisco,
+    /// Aruba, Huawei and Juniper all ship that way.
+    private static let defaultBaud = 9600
 
     private var groupNames: [String] {
         var names = model.store.groups.map(\.name)
@@ -87,6 +98,12 @@ struct QuickConnectSheet: View {
                         }
                     }
 
+                    Picker("Device family", selection: $vendor) {
+                        ForEach(Vendor.allCases) { family in
+                            Text(family.label).tag(family)
+                        }
+                    }
+
                     Toggle("Forward SSH agent", isOn: $agentForward)
 
                     TextField("Session name (optional)", text: $name)
@@ -118,6 +135,11 @@ struct QuickConnectSheet: View {
                     Picker("Baud rate", selection: $baud) {
                         ForEach(Self.baudRates, id: \.self) { rate in
                             Text(String(rate)).tag(rate)
+                        }
+                    }
+                    Picker("Device family", selection: $vendor) {
+                        ForEach(Vendor.allCases) { family in
+                            Text(family.label).tag(family)
                         }
                     }
                 }
@@ -206,14 +228,17 @@ struct QuickConnectSheet: View {
     }
 
     private func connect() {
-        let host: Host
+        var host: Host
         if kind == .ssh {
             var hostUsername = username
             var credentialID = credentialSelection
 
             if let selected = model.credentialStore.credential(for: credentialSelection) {
                 hostUsername = selected.username
-            } else if saveCredential {
+            } else if saveCredential, !password.isEmpty {
+                // CredentialStore skips the Keychain write for an empty
+                // password, which left the host bound to a credential that
+                // could never authenticate and prompted on every connect.
                 let credential = model.credentialStore.add(
                     name: credentialName.isEmpty ? defaultCredentialName : credentialName,
                     username: username,
@@ -242,6 +267,9 @@ struct QuickConnectSheet: View {
                 port: baud
             )
         }
+        // .auto stays nil so passive detection runs; a specific pick is a
+        // deliberate (manual/saved) choice, which turns detection off.
+        host.vendor = vendor == .auto ? nil : vendor
         let sessionPassword: String?
         if kind == .ssh, credentialSelection == nil, !password.isEmpty {
             sessionPassword = password

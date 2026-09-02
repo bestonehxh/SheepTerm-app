@@ -3,6 +3,11 @@ import SwiftUI
 /// Edits an existing host in place (right-click → Edit Host…).
 struct HostEditSheet: View {
     @EnvironmentObject var model: AppModel
+    /// Observed explicitly: `credentials` is @Published on CredentialStore,
+    /// not on AppModel, so observing `model` alone never redraws this list.
+    /// It looked fine only because every interaction happened to touch some
+    /// local @State as well.
+    @ObservedObject private var credentialStore = AppModel.shared.credentialStore
     @Environment(\.dismiss) private var dismiss
 
     let original: Host
@@ -15,9 +20,13 @@ struct HostEditSheet: View {
     @State private var credentialSelection: UUID?
     @State private var cipherMode: CipherMode
     @State private var agentForward: Bool
+    @State private var vendor: Vendor
     @State private var baud: Int
 
     private static let baudRates = [9600, 19200, 38400, 57600, 115200, 230400]
+    /// Console ports on network gear are 9600 8N1 out of the box — Cisco,
+    /// Aruba, Huawei and Juniper all ship that way.
+    private static let defaultBaud = 9600
 
     init(host: Host) {
         original = host
@@ -28,7 +37,8 @@ struct HostEditSheet: View {
         _credentialSelection = State(initialValue: host.credentialID)
         _cipherMode = State(initialValue: host.cipherMode ?? .auto)
         _agentForward = State(initialValue: host.agentForward ?? false)
-        _baud = State(initialValue: host.kind == .serial ? host.port : 115200)
+        _vendor = State(initialValue: host.highlightVendor)
+        _baud = State(initialValue: host.kind == .serial ? host.port : Self.defaultBaud)
     }
 
     var body: some View {
@@ -77,6 +87,14 @@ struct HostEditSheet: View {
                         }
                     }
                 }
+                Picker("Device family", selection: $vendor) {
+                    ForEach(Vendor.allCases) { family in
+                        Text(family.label).tag(family)
+                    }
+                }
+                Text("Picks the highlight rules. Auto colours only what every device shares — addresses, masks, MACs, VLAN ids, up/down. Naming the family adds its port names and reads its state words the way that platform means them.")
+                    .font(.system(size: 10))
+                    .foregroundStyle(.secondary)
             }
             .textFieldStyle(.roundedBorder)
 
@@ -116,6 +134,7 @@ struct HostEditSheet: View {
         host.name = name.trimmingCharacters(in: .whitespaces)
         host.address = address.trimmingCharacters(in: .whitespacesAndNewlines)
         host.username = username.trimmingCharacters(in: .whitespaces)
+        host.vendor = vendor
         switch original.kind {
         case .ssh:
             // isValid already guarantees a parsed in-range port; the
@@ -137,6 +156,10 @@ struct HostEditSheet: View {
             host.port = baud
         case .local:
             break
+        }
+        // The cached password belongs to the OLD user@address:port.
+        if let old = model.store.groups.flatMap(\.hosts).first(where: { $0.id == host.id }) {
+            model.forgetCachedPassword(for: old)
         }
         model.store.updateHost(host)
         dismiss()

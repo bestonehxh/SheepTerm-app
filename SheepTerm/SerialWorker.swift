@@ -8,6 +8,9 @@ nonisolated final class SerialWorker: Sendable {
     private let queue = DispatchQueue(label: "sheepterm.serial.session")
     private struct State: Sendable {
         var pendingWrites: [UInt8] = []
+        /// Set when input was discarded because the buffer is full; cleared
+        /// by the next accepted write, so one stall produces one notice.
+        var writeOverflowNotified = false
         /// True from start() until run() has completed all of its defers.
         /// Kept separate from `running`, which stop() clears immediately.
         var runActive = false
@@ -16,12 +19,22 @@ nonisolated final class SerialWorker: Sendable {
         var wakeFD: Int32 = -1
         var onData: (@Sendable ([UInt8]) -> Void)?
         var onNotice: (@Sendable (String) -> Void)?
+        /// Fired when a write was refused. A paced paste has to stop: the
+        /// pacer counts lines it HANDED OVER, so without this the HUD
+        /// reports a full send while the device got a config with holes.
+        var onInputDiscarded: (@Sendable () -> Void)?
         var onStatus: (@Sendable (String) -> Void)?
         var onClosed: (@Sendable (String) -> Void)?
     }
     private let state = Mutex(State())
     /// Cap on buffered input — a wedged session must not grow it forever.
-    private static let maxPendingWrites = 1024 * 1024
+    ///
+    /// Sized ABOVE the app's own paste limit on purpose. At 1 MB it was
+    /// smaller than `SafePastePlan.maxBytes`, so a legal 2 MB paste — or any
+    /// single-line clipboard over 1 MB, which bypasses Safe Paste entirely —
+    /// was refused whole on a perfectly healthy session and reported as if
+    /// the connection had stalled.
+    private static let maxPendingWrites = SafePastePlan.maxBytes + 1024 * 1024
 
     var onData: (@Sendable ([UInt8]) -> Void)? {
         get { state.withLock { $0.onData } }
@@ -30,6 +43,11 @@ nonisolated final class SerialWorker: Sendable {
     var onNotice: (@Sendable (String) -> Void)? {
         get { state.withLock { $0.onNotice } }
         set { state.withLock { $0.onNotice = newValue } }
+    }
+
+    var onInputDiscarded: (@Sendable () -> Void)? {
+        get { state.withLock { $0.onInputDiscarded } }
+        set { state.withLock { $0.onInputDiscarded = newValue } }
     }
     var onStatus: (@Sendable (String) -> Void)? {
         get { state.withLock { $0.onStatus } }
@@ -48,6 +66,7 @@ nonisolated final class SerialWorker: Sendable {
             state.runActive = true
             state.running = true
             state.pendingWrites.removeAll(keepingCapacity: true)
+            state.writeOverflowNotified = false
             return true
         }
         // A refusal must SAY so — see the matching note in SSHWorker.start.
@@ -72,18 +91,52 @@ nonisolated final class SerialWorker: Sendable {
         }
     }
 
-    func write(_ bytes: [UInt8]) {
+    /// Returns false when the input was refused, so a paced paste can stop
+    /// instead of reporting lines it never sent.
+    @discardableResult
+    func write(_ bytes: [UInt8]) -> Bool {
+        // Fired outside the lock: onNotice hops to the main actor, and this
+        // Mutex is not recursive.
+        var notice: (@Sendable (String) -> Void)?
+        var message = ""
+        var accepted = false
+        var discarded: (@Sendable () -> Void)?
         state.withLock { state in
-            // A dead or wedged session must not buffer input forever.
-            guard state.running else { return }
-            let room = Self.maxPendingWrites - state.pendingWrites.count
-            guard room > 0 else { return }
-            state.pendingWrites.append(contentsOf: bytes.prefix(room))
+            // A dead or wedged session must not buffer input forever — and
+            // a paced paste has to hear about the refusal, exactly as it
+            // does for a full buffer, or it keeps counting lines the port
+            // never got.
+            guard state.running else {
+                discarded = state.onInputDiscarded
+                return
+            }
+            // All-or-nothing, and on a console cable this is the case that
+            // matters most: the old code appended `bytes.prefix(room)`, so a
+            // paced paste into a 9600-baud port — which drains ~960 B/s while
+            // the pacer feeds ~8 KB/s — would eventually send the FRONT of a
+            // config line to a live switch and drop the rest.
+            guard state.pendingWrites.count + bytes.count <= Self.maxPendingWrites else {
+                discarded = state.onInputDiscarded
+                if !state.writeOverflowNotified {
+                    state.writeOverflowNotified = true
+                    notice = state.onNotice
+                    message = bytes.count > Self.maxPendingWrites
+                        ? "that paste is larger than SheepTerm will send in one go — nothing was sent"
+                        : "serial port is not draining — input is being discarded until it catches up"
+                }
+                return
+            }
+            state.writeOverflowNotified = false
+            state.pendingWrites.append(contentsOf: bytes)
+            accepted = true
             if state.wakeFD >= 0 {
                 var byte: UInt8 = 0
                 _ = Darwin.write(state.wakeFD, &byte, 1)
             }
         }
+        if let notice { notice(message) }
+        discarded?()
+        return accepted
     }
 
     private var isRunning: Bool {
@@ -268,7 +321,7 @@ nonisolated final class SerialWorker: Sendable {
                         // EOF — device gone (cable unplugged).
                         onClosed?("serial device disconnected")
                         return
-                    } else if errno != EAGAIN {
+                    } else if errno != EAGAIN && errno != EINTR {
                         onClosed?("read failed: \(String(cString: strerror(errno)))")
                         return
                     }

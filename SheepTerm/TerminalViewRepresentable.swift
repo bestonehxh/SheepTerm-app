@@ -20,6 +20,11 @@ struct TerminalViewRepresentable: NSViewRepresentable {
                 // NSTextView field editor — never yank its focus away just
                 // because a @Published change re-ran this update.
                 guard !(window.firstResponder is NSTextView) else { return }
+                // Same for the sidebar outline. It handles Return-to-connect,
+                // which was unreachable in practice: any @Published change —
+                // and selecting a row causes several — stole focus back here
+                // before the key could arrive.
+                guard !(window.firstResponder is NSOutlineView) else { return }
                 window.makeFirstResponder(view)
             }
         }

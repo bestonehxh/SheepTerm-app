@@ -20,12 +20,35 @@ final class SessionTab: ObservableObject, Identifiable {
     @Published var highlightEnabled = false {
         didSet {
             switch content {
-            case .ssh(let controller): controller.highlightEnabled = highlightEnabled
-            case .serial(let controller): controller.highlightEnabled = highlightEnabled
+            case .ssh(let controller): controller.setHighlightEnabled(highlightEnabled)
+            case .serial(let controller): controller.setHighlightEnabled(highlightEnabled)
+            case .local: return
+            }
+            // The default for the NEXT tab follows whichever toggle was used
+            // last — ⇧⌘H, the status-bar sheep, or the tab's context menu.
+            // Two of the three used to write it and the third did not.
+            UserDefaults.standard.set(highlightEnabled, forKey: "highlightDefault")
+        }
+    }
+    /// Highlight rule pack for this tab. Starts from the host and can be
+    /// switched live (View menu, status bar) for a console you turn out to be
+    /// on a different box than you thought — a serial cable does not announce
+    /// its vendor, and neither does a jump host.
+    @Published var highlightVendor: Vendor = .auto {
+        didSet {
+            switch content {
+            case .ssh(let controller): controller.adoptVendor(highlightVendor)
+            case .serial(let controller): controller.adoptVendor(highlightVendor)
             case .local: break
             }
         }
     }
+    /// True once the family is the user's own pick (menu / status bar) or a
+    /// saved host's explicit `vendor`. Passive stream detection is disabled
+    /// while this is set — even for an explicit `.auto` — so a deliberate
+    /// choice is never silently overridden. The auto-detect path leaves it
+    /// false, so a later manual pick still wins.
+    var vendorManuallyChosen = false
     var wasConnected = false
     var autoReconnectAttempts = 0
     /// Guards the recent-host entry to exactly one write per connect:
@@ -307,7 +330,6 @@ final class AppModel: ObservableObject {
     /// Session-lifetime memory of passwords that worked (keyed
     /// user@host:port) so reconnects don't ask again. Never written to disk.
     private var passwordCache: [String: String] = [:]
-    let highlightStore = HighlightStore()
     private var keyMonitor: Any?
 
     private init() {
@@ -329,13 +351,21 @@ final class AppModel: ObservableObject {
         terminalTheme = UserDefaults.standard.string(forKey: "terminalTheme") ?? "sheepterm"
         applyDockIcon()
         showStatusBar = UserDefaults.standard.object(forKey: "showStatusBar") as? Bool ?? true
-        statusShowSession = UserDefaults.standard.object(forKey: "statusShowSession") as? Bool ?? true
-        statusShowHints = UserDefaults.standard.object(forKey: "statusShowHints") as? Bool ?? true
-        statusShowIP = UserDefaults.standard.object(forKey: "statusShowIP") as? Bool ?? true
+        // Session text (device IP + username), shortcut hints and This-Mac IP
+        // start HIDDEN — the bar shows just the connection dot, the highlight
+        // sheep/vendor control and the clock until the user opts them back in
+        // (View → Bottom Bar Items).
+        statusShowSession = UserDefaults.standard.object(forKey: "statusShowSession") as? Bool ?? false
+        statusShowHints = UserDefaults.standard.object(forKey: "statusShowHints") as? Bool ?? false
+        statusShowIP = UserDefaults.standard.object(forKey: "statusShowIP") as? Bool ?? false
         statusShowClock = UserDefaults.standard.object(forKey: "statusShowClock") as? Bool ?? true
         // Launched from Finder the cwd is "/"; start shells at home like Terminal.app.
         FileManager.default.changeCurrentDirectoryPath(NSHomeDirectory())
         purgeTeamShareLeftovers()
+        // The highlight rules and their colours are fixed built-in constants
+        // now. Compile the per-vendor packs once, here — there is no Settings
+        // UI left to recompile them, so nothing ever calls this again.
+        Highlighter.installDefaults()
         newLocalTab()
         installKeyMonitor()
     }
@@ -353,16 +383,15 @@ final class AppModel: ObservableObject {
         appIcon = Self.resolveStoredIcon(defaults)
         terminalTheme = defaults.string(forKey: "terminalTheme") ?? "sheepterm"
         showStatusBar = defaults.object(forKey: "showStatusBar") as? Bool ?? true
-        statusShowSession = defaults.object(forKey: "statusShowSession") as? Bool ?? true
-        statusShowHints = defaults.object(forKey: "statusShowHints") as? Bool ?? true
-        statusShowIP = defaults.object(forKey: "statusShowIP") as? Bool ?? true
+        statusShowSession = defaults.object(forKey: "statusShowSession") as? Bool ?? false
+        statusShowHints = defaults.object(forKey: "statusShowHints") as? Bool ?? false
+        statusShowIP = defaults.object(forKey: "statusShowIP") as? Bool ?? false
         statusShowClock = defaults.object(forKey: "statusShowClock") as? Bool ?? true
         let width = defaults.double(forKey: "sidebarWidth")
         sidebarWidth = width == 0 ? 232 : min(max(width, 200), 320)
         applyDockIcon()
         store.reloadFromDisk()
         credentialStore.reloadFromDisk()
-        highlightStore.reloadFromDisk()
     }
 
     /// Team Share (LAN sharing + vault + team passphrase) was removed after
@@ -400,9 +429,8 @@ final class AppModel: ObservableObject {
     /// the very same TerminalView instances, so the terminal blanks and
     /// reparents between them.
     func importFile(at url: URL) {
-        guard url.pathExtension == "sheepterm",
-              let data = try? Data(contentsOf: url),
-              let payload = try? ShareCodec.decode(data) else { return }
+        guard url.pathExtension == "sheepterm" else { return }
+        guard let payload = decodeImport(at: url) else { return }
         // Never import silently — same confirmation as the menu path.
         confirmImport(payload)
     }
@@ -413,9 +441,52 @@ final class AppModel: ObservableObject {
             panel.allowedContentTypes = [type, .json]
         }
         guard panel.runModal() == .OK, let url = panel.url,
-              let data = try? Data(contentsOf: url),
-              let payload = try? ShareCodec.decode(data) else { return }
+              let payload = decodeImport(at: url) else { return }
         confirmImport(payload)
+    }
+
+    /// A file that cannot be read or decoded used to do NOTHING — no dialog,
+    /// no log — which for a double-clicked .sheepterm looks like the app
+    /// ignored the click. Say what went wrong instead.
+    private func decodeImport(at url: URL) -> SharePayload? {
+        do {
+            return try ShareCodec.decode(try Data(contentsOf: url))
+        } catch {
+            let alert = NSAlert()
+            alert.alertStyle = .warning
+            alert.messageText = "Could not import \(url.lastPathComponent)"
+            alert.informativeText = error.localizedDescription
+            alert.addButton(withTitle: "OK")
+            alert.runModal()
+            return nil
+        }
+    }
+
+    /// Forgets the session-cached password for one connection. The cache is
+    /// keyed user@address:port and lived until quit, so a credential the
+    /// user DELETED, or a host whose identity was edited, kept authenticating
+    /// with the old password for the rest of the session.
+    func forgetCachedPassword(for host: Host) {
+        passwordCache.removeValue(forKey: "\(host.username)@\(host.address):\(host.port)")
+    }
+
+    func forgetCachedPasswords(forCredential id: UUID) {
+        for host in store.groups.flatMap(\.hosts) where host.credentialID == id {
+            forgetCachedPassword(for: host)
+        }
+    }
+
+    /// Quit: every SSH/serial worker stopped and every log closed and
+    /// flushed before the process exits. Synchronous by design — there is
+    /// no "later" after applicationShouldTerminate returns.
+    func shutdownSessionsForQuit() {
+        for tab in tabs {
+            switch tab.content {
+            case .ssh(let controller): controller.shutdownForQuit()
+            case .serial(let controller): controller.shutdownForQuit()
+            case .local: break
+            }
+        }
     }
 
     /// Shared guard for every .sheepterm import path (menu panel, Finder
@@ -428,6 +499,15 @@ final class AppModel: ObservableObject {
         // sidebar — strip them from the value itself, not just the dialog.
         group.name = Self.sanitizedForDialog(group.name)
         if group.name.isEmpty { group.name = "Imported Group" }
+        // Host names get the same treatment. They were left raw, and they
+        // reach further than the group name does: the sidebar, the tab title,
+        // and SessionLogger's file name — which only replaces "/" and ":".
+        for index in group.hosts.indices {
+            group.hosts[index].name = Self.sanitizedForDialog(group.hosts[index].name)
+            if group.hosts[index].name.isEmpty {
+                group.hosts[index].name = group.hosts[index].address
+            }
+        }
 
         guard let existing = store.existingGroup(matching: group) else {
             let alert = NSAlert()
@@ -646,6 +726,7 @@ final class AppModel: ObservableObject {
                     if host.username.isEmpty { host.username = match.username }
                     if host.cipherMode == nil { host.cipherMode = match.cipherMode }
                     if host.agentForward == nil { host.agentForward = match.agentForward }
+                    if host.vendor == nil { host.vendor = match.vendor }
                 }
             }
             let credential = host.credentialID.flatMap { credentialStore.credential(for: $0) }
@@ -657,6 +738,22 @@ final class AppModel: ObservableObject {
                 ?? passwordCache["\(host.username)@\(host.address):\(host.port)"]
             let controller = SSHTerminalController(host: host, password: password, reusingLogger: reusingLogger)
             let tab = SessionTab(content: .ssh(controller), title: host.name)
+            tab.highlightVendor = host.highlightVendor
+            // A saved host with an explicit family is the user's choice —
+            // passive detection must never override it. But `.auto` (nil OR a
+            // stored literal `auto`, which recents.json carries) is NOT a
+            // choice: it means "detect for me", so it must leave detection
+            // armed. Only a concrete family suppresses.
+            if let v = host.vendor, v != .auto {
+                tab.vendorManuallyChosen = true
+                controller.suppressVendorDetection()
+            }
+            // Passive detection names a family via the AUTO path: it sets the
+            // tab's vendor (one repaint) without marking it a manual choice.
+            controller.onVendorDetected = { [weak tab] detected in
+                guard let tab, !tab.vendorManuallyChosen else { return }
+                tab.highlightVendor = detected
+            }
             tab.highlightEnabled = UserDefaults.standard.object(forKey: "highlightDefault") as? Bool ?? true
             controller.onStatus = { [weak tab, weak self] status in
                 guard let tab else { return }
@@ -672,7 +769,9 @@ final class AppModel: ObservableObject {
                        case .ssh(let sshController) = tab.content,
                        !sshController.didAuthenticateWithPassword {
                         tab.didNoteRecent = true
-                        self?.store.noteRecent(host)
+                        // The controller's copy carries a username typed at
+                        // the prompt; the one captured here may be empty.
+                        self?.store.noteRecent(sshController.host)
                     }
                     // "ssh2" means auth succeeded, but the device may still
                     // refuse the shell (VTY full) — resetting attempts here
@@ -696,6 +795,22 @@ final class AppModel: ObservableObject {
             let controller = SerialTerminalController(host: host, reusingLogger: reusingLogger)
             controller.logOverride = serialLog
             let tab = SessionTab(content: .serial(controller), title: host.name)
+            tab.highlightVendor = host.highlightVendor
+            // A saved host with an explicit family is the user's choice —
+            // passive detection must never override it. But `.auto` (nil OR a
+            // stored literal `auto`, which recents.json carries) is NOT a
+            // choice: it means "detect for me", so it must leave detection
+            // armed. Only a concrete family suppresses.
+            if let v = host.vendor, v != .auto {
+                tab.vendorManuallyChosen = true
+                controller.suppressVendorDetection()
+            }
+            // Passive detection names a family via the AUTO path: it sets the
+            // tab's vendor (one repaint) without marking it a manual choice.
+            controller.onVendorDetected = { [weak tab] detected in
+                guard let tab, !tab.vendorManuallyChosen else { return }
+                tab.highlightVendor = detected
+            }
             tab.highlightEnabled = UserDefaults.standard.object(forKey: "highlightDefault") as? Bool ?? true
             controller.onStatus = { [weak tab, weak self] status in
                 guard let tab else { return }
@@ -748,6 +863,12 @@ final class AppModel: ObservableObject {
     /// typed in the form is used for this session even when not saved.
     func connectQuick(host: Host, saveTo groupName: String?, password: String? = nil, serialLog: Bool? = nil) {
         if let groupName {
+            // Saving from Quick Connect is a user action, so it has to re-arm
+            // writes the same way every HostStore mutator does — this path
+            // reaches into `groups` directly and used to skip that, which
+            // under post-corrupt suppression meant the new group appeared in
+            // the sidebar and was never written to disk.
+            store.noteExplicitUserMutation()
             if let index = store.groups.firstIndex(where: { $0.name == groupName }) {
                 let duplicate = store.groups[index].hosts.contains {
                     $0.address == host.address && $0.port == host.port && $0.username == host.username
@@ -846,6 +967,10 @@ final class AppModel: ObservableObject {
     /// Tears down an SSH/serial tab and opens a fresh session to the same
     /// host, keeping the tab's position in the strip.
     func reconnect(tab: SessionTab) {
+        // A stale caller — a context menu left open across an automatic
+        // reconnect — must not open a SECOND session to the host and take
+        // the log file out from under the one already running.
+        guard tabs.contains(where: { $0.id == tab.id }) else { return }
         let host: Host
         var serialLog: Bool?
         var handedLogger: SessionLogger?
@@ -862,12 +987,37 @@ final class AppModel: ObservableObject {
             handedLogger = controller.handOverLogger()
         case .local: return
         }
+        // The successor tab is rebuilt from scratch, so its highlight state
+        // would revert to defaults — throwing away a device family the user
+        // picked (or that was auto-detected) mid-session, and the on/off
+        // toggle. Carry all three across. (A tab left on .auto with no manual
+        // choice will simply re-detect on the reconnected stream anyway.)
+        let oldVendor = tab.highlightVendor
+        let oldManual = tab.vendorManuallyChosen
+        let oldHighlightEnabled = tab.highlightEnabled
         let index = tabs.firstIndex { $0.id == tab.id }
         close(tab: tab)
         open(host: host, serialLog: serialLog, reusingLogger: handedLogger)
-        if let index, let newTab = tabs.last, tabs.count > 1, index < tabs.count - 1 {
-            tabs.removeLast()
-            tabs.insert(newTab, at: index)
+        if let newTab = tabs.last {
+            newTab.vendorManuallyChosen = oldManual
+            // An explicit choice (including an explicit .auto) must keep
+            // passive detection OFF on the new controller too.
+            if oldManual {
+                switch newTab.content {
+                case .ssh(let controller): controller.suppressVendorDetection()
+                case .serial(let controller): controller.suppressVendorDetection()
+                case .local: break
+                }
+            }
+            // didSet on these re-applies the family (adoptVendor → repaint if
+            // enabled) and the on/off state; once the session connects, the
+            // onStatus/onData path schedules the first paint.
+            newTab.highlightVendor = oldVendor
+            newTab.highlightEnabled = oldHighlightEnabled
+            if let index, tabs.count > 1, index < tabs.count - 1 {
+                tabs.removeLast()
+                tabs.insert(newTab, at: index)
+            }
         }
     }
 
@@ -900,12 +1050,36 @@ final class AppModel: ObservableObject {
     }
 
     /// ⌘⇧H — flips display highlighting for the active SSH/serial session.
+    /// Switches the visible tab's highlight pack.
+    ///
+    /// The choice is remembered on the host too, so the next connect starts
+    /// there — a serial console you had to identify by eye should only need
+    /// identifying once. Everything already on screen is RE-coloured, which
+    /// is the whole reason highlighting moved into the grid; on a full
+    /// scrollback that repaint costs ~200 ms of main thread.
+    func setHighlightVendorCurrent(_ vendor: Vendor) {
+        guard let tab = selectedTab else { return }
+        // Mark the choice as the user's BEFORE changing the vendor, and stop
+        // passive detection on the controller — a deliberate pick (including
+        // an explicit Auto) must never be undone by the stream fingerprint.
+        tab.vendorManuallyChosen = true
+        switch tab.content {
+        case .ssh(let controller):
+            controller.suppressVendorDetection()
+            store.setVendor(vendor, matching: controller.host)
+        case .serial(let controller):
+            controller.suppressVendorDetection()
+            store.setVendor(vendor, matching: controller.host)
+        case .local: break
+        }
+        tab.highlightVendor = vendor
+    }
+
     func toggleHighlightCurrent() {
         guard let tab = selectedTab else { return }
         switch tab.content {
         case .ssh, .serial:
-            tab.highlightEnabled.toggle()
-            UserDefaults.standard.set(tab.highlightEnabled, forKey: "highlightDefault")
+            tab.highlightEnabled.toggle() // didSet records the new default
         case .local:
             break
         }

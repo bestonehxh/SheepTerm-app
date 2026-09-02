@@ -15,6 +15,106 @@ enum ConnectionKind: String, Codable {
     }
 }
 
+/// Which device family a session talks to. Selects the highlight rule pack:
+/// the eleven rule NAMES are the same everywhere, but their keyword lists and
+/// a few shape flags come from `HighlightScanner.Profile` for this vendor.
+///
+/// `auto` is the vendor-NEUTRAL CORE, not a union: addresses, masks, CIDR,
+/// MACs, VLAN ids, and the state words that mean the same thing on every box.
+/// It deliberately carries NO `interface` and NO `cx-port` rule, because an
+/// interface name is the most vendor-specific token there is and guessing it
+/// is what tore `ge-0/0/0` in half and would put FortiGate's `port1` and a
+/// service `port 443` in the same colour.
+///
+/// So a host that has never been given a family colours LESS than it did
+/// before packs existed — port names stay plain until a family is picked.
+/// That is the intended trade: never mislead, rather than always colour.
+/// Picking a family adds its port names and re-reads the words whose MEANING
+/// is vendor specific — `deny` is a fault on a switch and an intended policy
+/// action on a firewall, and FortiOS ends nearly every config line in
+/// enable/disable.
+///
+/// Adding a device family is meant to be one `Profile` literal and one case
+/// here — never a change to a matcher, a rule bit, or the start table.
+nonisolated enum Vendor: String, Codable, CaseIterable, Identifiable, Sendable {
+    case auto
+    case cisco
+    case arubaCX
+    case arubaOS
+    case huawei
+    case comware
+    case juniper
+    case panos
+    case fortios
+    case gaia
+    case linux
+
+    var id: String { rawValue }
+
+    /// Tolerant of raw values this build does not know. The synthesized
+    /// decoder THROWS on an unrecognised string, and `Vendor?` does not save
+    /// you — optionality covers a missing key, not a bad value — so one
+    /// stale or hand-edited entry would fail the whole `[HostGroup]` decode
+    /// and send hosts.json to the corrupt-file quarantine. Unknown reads as
+    /// `.auto`, which is exactly what "we don't know this device" means.
+    init(from decoder: Decoder) throws {
+        let raw = try? decoder.singleValueContainer().decode(String.self)
+        self = raw.flatMap(Vendor.init(rawValue:)) ?? .auto
+    }
+
+    var label: String {
+        switch self {
+        case .auto: return "Auto (all vendors)"
+        case .cisco: return "Cisco IOS / IOS-XE / NX-OS"
+        case .arubaCX: return "Aruba CX"
+        case .arubaOS: return "ArubaOS (Controller / MM)"
+        case .huawei: return "Huawei VRP"
+        case .comware: return "H3C / HPE Comware"
+        case .juniper: return "Juniper Junos"
+        case .panos: return "Palo Alto PAN-OS"
+        case .fortios: return "Fortinet FortiOS"
+        case .gaia: return "Check Point Gaia"
+        case .linux: return "Linux / server"
+        }
+    }
+
+    /// Dense index into `Highlighter`'s per-vendor rule table. Written out
+    /// rather than derived from `allCases` because the matching path reads it
+    /// once per text run — thousands of times per escape-heavy chunk.
+    var slot: Int {
+        switch self {
+        case .auto: return 0
+        case .cisco: return 1
+        case .arubaCX: return 2
+        case .arubaOS: return 3
+        case .huawei: return 4
+        case .comware: return 5
+        case .juniper: return 6
+        case .panos: return 7
+        case .fortios: return 8
+        case .gaia: return 9
+        case .linux: return 10
+        }
+    }
+
+    /// Short form for the status bar and the tab context menu.
+    var badge: String {
+        switch self {
+        case .auto: return "Auto"
+        case .cisco: return "Cisco"
+        case .arubaCX: return "Aruba CX"
+        case .arubaOS: return "ArubaOS"
+        case .huawei: return "Huawei"
+        case .comware: return "Comware"
+        case .juniper: return "Junos"
+        case .panos: return "PAN-OS"
+        case .fortios: return "FortiOS"
+        case .gaia: return "Gaia"
+        case .linux: return "Linux"
+        }
+    }
+}
+
 enum CipherMode: String, Codable, CaseIterable, Identifiable, Sendable {
     case auto
     case modern
@@ -43,6 +143,13 @@ struct Host: Identifiable, Codable, Hashable {
     /// ForwardAgent for this host. Optional (not a defaulted Bool) so hosts
     /// written by an older build still decode — a missing key would throw.
     var agentForward: Bool? = nil
+    /// Highlight rule pack. Optional for the same forward-compat reason as
+    /// `agentForward`; a missing key means `.auto`, so hosts saved before
+    /// this existed keep the union behaviour they were coloured with.
+    var vendor: Vendor? = nil
+
+    /// The pack to actually highlight with — `vendor` with the nil hole filled.
+    var highlightVendor: Vendor { vendor ?? .auto }
 
     /// Connection identity used for recents dedup and "same target"
     /// matching — the UUID is NOT part of it, so a recent entry and the
@@ -124,8 +231,13 @@ enum ConnectParser {
 
 @MainActor
 final class HostStore: ObservableObject {
-    @Published var groups: [HostGroup]
-    @Published var recents: [Host]
+    @Published var groups: [HostGroup] { didSet { revision &+= 1 } }
+    @Published var recents: [Host] { didSet { revision &+= 1 } }
+    /// Bumped on every change to either list. The sidebar compares this
+    /// instead of rebuilding every SidebarItem and joining a String from
+    /// every row just to discover nothing changed — which it did on every
+    /// AppModel publish, including each frame of a divider drag.
+    private(set) var revision = 0
 
     /// Non-nil when a data file existed at launch but failed to decode.
     /// The original is preserved next to it as "<name>.corrupt-<timestamp>";
@@ -236,6 +348,12 @@ final class HostStore: ObservableObject {
         suppressWritesAfterCorruptLoad = false
     }
 
+    /// For the one caller that mutates `groups` directly instead of going
+    /// through a mutator here (Quick Connect's save-to-group).
+    func noteExplicitUserMutation() {
+        noteUserMutation()
+    }
+
     func save() {
         mergeGroupsFromDiskIfNeeded()
         if write(groups, to: Self.fileURL) {
@@ -284,7 +402,11 @@ final class HostStore: ObservableObject {
         for i in merged.indices {
             guard let diskGroup = diskGroupsByID[merged[i].id] else { continue }
             let knownHostIDs = Set(merged[i].hosts.map(\.id))
-            let hostsOnlyOnDisk = diskGroup.hosts.filter { !knownHostIDs.contains($0.id) }
+            // Deduped by id for the same reason the group merge below is: a
+            // disk group can carry the same host id twice, and appending both
+            // puts two rows with one identity into the outline.
+            var seenHostIDs = knownHostIDs
+            let hostsOnlyOnDisk = diskGroup.hosts.filter { seenHostIDs.insert($0.id).inserted }
             guard !hostsOnlyOnDisk.isEmpty else { continue }
             merged[i].hosts.append(contentsOf: hostsOnlyOnDisk)
             changed = true
@@ -350,11 +472,16 @@ final class HostStore: ObservableObject {
         do {
             let data = try encoder.encode(value)
             if FileManager.default.fileExists(atPath: url.path) {
+                // Copy beside the old .bak and swap, so a failed copy leaves
+                // the PREVIOUS backup in place instead of no backup at all.
                 let backupURL = url.appendingPathExtension("bak")
-                try? FileManager.default.removeItem(at: backupURL)
+                let stagingURL = url.appendingPathExtension("bak.tmp")
                 do {
-                    try FileManager.default.copyItem(at: url, to: backupURL)
+                    try? FileManager.default.removeItem(at: stagingURL)
+                    try FileManager.default.copyItem(at: url, to: stagingURL)
+                    _ = try FileManager.default.replaceItemAt(backupURL, withItemAt: stagingURL)
                 } catch {
+                    try? FileManager.default.removeItem(at: stagingURL)
                     NSLog("SheepTerm: could not back up %@: %@",
                           url.lastPathComponent, error.localizedDescription)
                 }
@@ -406,10 +533,13 @@ final class HostStore: ObservableObject {
     /// Returns false (and changes nothing) when the name is taken.
     @discardableResult
     func renameGroup(_ group: HostGroup, to name: String) -> Bool {
-        noteUserMutation()
         let trimmed = name.trimmingCharacters(in: .whitespaces)
         guard !trimmed.isEmpty, let index = groups.firstIndex(where: { $0.id == group.id }) else { return false }
         guard !groups.contains(where: { $0.id != group.id && $0.name == trimmed }) else { return false }
+        // AFTER validation: a rejected rename is not a user change, and
+        // re-arming writes on one would let the next automatic save overwrite
+        // a file that was deliberately quarantined.
+        noteUserMutation()
         groups[index].name = trimmed
         save()
         return true
@@ -477,6 +607,7 @@ final class HostStore: ObservableObject {
             var group = incoming
             group.id = UUID()
             group.name = uniqueGroupName(base: incoming.name)
+            group.hosts = Self.freshIDs(group.hosts)
             groups.append(group)
             stats.addedGroup = true
             stats.addedHosts = group.hosts.count
@@ -488,6 +619,7 @@ final class HostStore: ObservableObject {
                 var group = incoming
                 group.id = UUID()
                 group.name = uniqueGroupName(base: incoming.name)
+                group.hosts = Self.freshIDs(group.hosts)
                 groups.append(group)
                 stats.addedGroup = true
                 stats.addedHosts = group.hosts.count
@@ -505,18 +637,67 @@ final class HostStore: ObservableObject {
                     guard replace[inc.id] == true else { continue }
                     var merged = inc
                     // 0.4 (ค)1: a replaced host keeps OUR credential
-                    // reference — the file carries none.
+                    // reference — the file carries none — and OUR id, so
+                    // open tabs and the sidebar keep pointing at it.
                     merged.credentialID = current.credentialID
+                    merged.id = current.id
                     groups[index].hosts[hostIndex] = merged
                     stats.replacedHosts += 1
                 } else {
-                    groups[index].hosts.append(inc)
+                    var added = inc
+                    added.id = UUID()
+                    groups[index].hosts.append(added)
                     stats.addedHosts += 1
                 }
             }
         }
         save()
         return stats
+    }
+
+    /// A host id must be unique across ALL groups: removeHost and updateHost
+    /// look hosts up by id, and the sidebar caches rows by it. The file's
+    /// own ids are kept out on purpose — importing the same file twice as
+    /// two groups used to give both groups hosts with identical ids, so one
+    /// delete removed the host from BOTH and an edit reached only the first.
+    /// Conflict matching does not need them (address+port+username).
+    private static func freshIDs(_ hosts: [Host]) -> [Host] {
+        hosts.map { var host = $0; host.id = UUID(); return host }
+    }
+
+    /// Records a live device-family switch everywhere this connection is
+    /// remembered. Matched by connection identity, not id, so a tab opened
+    /// from a recent entry still updates the saved host it belongs to.
+    ///
+    /// EVERY match is written, not just the first: the same box can be saved
+    /// in two groups, and leaving the others stale means the choice silently
+    /// depends on which copy you happened to launch from. Recents are written
+    /// too — a Quick Connect target or a serial console that is not a saved
+    /// host has nowhere else to keep it, and that is precisely the case where
+    /// the family had to be identified by eye and must not be asked again.
+    func setVendor(_ vendor: Vendor, matching target: Host) {
+        var changedHosts = false
+        for groupIndex in groups.indices {
+            for hostIndex in groups[groupIndex].hosts.indices
+            where groups[groupIndex].hosts[hostIndex].sameConnection(as: target)
+                && groups[groupIndex].hosts[hostIndex].vendor != vendor {
+                if !changedHosts { noteUserMutation(); changedHosts = true }
+                groups[groupIndex].hosts[hostIndex].vendor = vendor
+            }
+        }
+        if changedHosts { save() }
+
+        var changedRecents = false
+        for index in recents.indices
+        where recents[index].sameConnection(as: target) && recents[index].vendor != vendor {
+            // Before the write, not after: this is a user action, and under
+            // post-corrupt write suppression an un-armed saveRecents() drops
+            // it silently — which is exactly the Quick Connect / serial
+            // console case this method exists for.
+            if !changedRecents { noteUserMutation(); changedRecents = true }
+            recents[index].vendor = vendor
+        }
+        if changedRecents { saveRecents() }
     }
 
     func updateHost(_ host: Host) {
@@ -548,6 +729,7 @@ final class HostStore: ObservableObject {
             recents[index].credentialID = new.credentialID
             recents[index].cipherMode = new.cipherMode
             recents[index].agentForward = new.agentForward
+            recents[index].vendor = new.vendor
             changed = true
         }
         guard changed else { return }
@@ -576,8 +758,11 @@ final class HostStore: ObservableObject {
 
     /// How many saved hosts reference a credential — shown in the delete
     /// confirmation before the credential is removed.
+    /// Counts recents too: the delete dialog quoting a smaller number than
+    /// the change actually affects is worse than no number.
     func hostCount(usingCredential id: UUID) -> Int {
         groups.reduce(0) { $0 + $1.hosts.filter { $0.credentialID == id }.count }
+            + recents.filter { $0.credentialID == id }.count
     }
 
     /// Detaches a credential from every host that references it (used
@@ -594,6 +779,15 @@ final class HostStore: ObservableObject {
             }
         }
         if changed { save() }
+        // Recents carry credentialID too (updateRecents propagates it on an
+        // edit), so leaving them behind pointed at a Keychain entry that no
+        // longer exists.
+        var changedRecents = false
+        for index in recents.indices where recents[index].credentialID == id {
+            recents[index].credentialID = nil
+            changedRecents = true
+        }
+        if changedRecents { saveRecents() }
     }
 
     /// Live reorder used while dragging a group over another; call save() when
@@ -732,4 +926,12 @@ struct GroupImportStats {
     /// Existing hosts overwritten by an incoming host with the same id
     /// or address+port+username.
     var replacedHosts = 0
+}
+
+extension String {
+    /// Sidebar / Quick Search matching: case- and diacritic-insensitive, so
+    /// `cafe` finds `café-sw1`. Thai has neither, so it is unaffected.
+    func matchesSearch(_ query: String) -> Bool {
+        range(of: query, options: [.caseInsensitive, .diacriticInsensitive], locale: .current) != nil
+    }
 }
