@@ -115,6 +115,11 @@ nonisolated enum HighlightScanner {
         /// everywhere would colour any `1234-5678-9012`-shaped token, so it
         /// stays with the families that actually print MACs that way.
         let macDashGroups: Bool
+        /// `3810f0-7ade00` — two dash-separated 6-hex groups, which is how
+        /// AOS-CX prints the chassis base MAC (`show system`). Same reasoning
+        /// as `macDashGroups`: the shape is generic enough that only the
+        /// families that really print it that way carry it.
+        let macSixHexGroups: Bool
         /// Which of the eleven rules this family uses at all. `cx-port` is
         /// the one that matters: it claims `0/0/0`, so leaving it on for
         /// Junos would tear `ge-0/0/0` in half.
@@ -138,6 +143,7 @@ nonisolated enum HighlightScanner {
             digitSpeedPorts: Bool = false,
             vlanRanges: Bool = false,
             macDashGroups: Bool = false,
+            macSixHexGroups: Bool = false,
             omitting: Set<BuiltIn> = []
         ) {
             let ifKws = Profile.sortLongestFirst(interface)
@@ -154,6 +160,7 @@ nonisolated enum HighlightScanner {
             self.digitSpeedPorts = digitSpeedPorts
             self.vlanRanges = vlanRanges
             self.macDashGroups = macDashGroups
+            self.macSixHexGroups = macSixHexGroups
             rules = BuiltIn.allCases.reduce(into: UInt16(0)) {
                 if !omitting.contains($1) { $0 |= HighlightScanner.bit(of: $1) }
             }
@@ -391,9 +398,13 @@ nonisolated enum HighlightScanner {
         return p
     }
 
-    /// \b(?:h{4}[.\-]){2}h{4}\b | \b(?:h{2}[:\-]){5}h{2}\b — left alternative
-    /// first. The dash form of the left one is Huawei's 00e0-fc12-3456 and is
-    /// only in the pattern for families that print MACs that way.
+    /// \b(?:h{4}[.\-]){2}h{4}\b | \b(?:h{2}[:\-]){5}h{2}\b | \bh{6}-h{6}\b —
+    /// alternatives tried in pattern order. The dash form of the first one is
+    /// Huawei's 00e0-fc12-3456 and the third is AOS-CX's 3810f0-7ade00; both
+    /// are in the pattern only for families that print MACs that way. The
+    /// three shapes put their separators in different places, so no token can
+    /// match two of them — but the order still mirrors the regex exactly,
+    /// because that equality is the only thing keeping the two paths honest.
     static func matchMAC(_ b: [UInt8], _ s: Int, _ profile: Profile) -> Int? {
         guard boundaryBefore(b, s) else { return nil }
         func hexRun(_ p: Int, _ n: Int) -> Int? {
@@ -424,6 +435,12 @@ nonisolated enum HighlightScanner {
             p = e + 1
         }
         if ok, let e = hexRun(p, 2), boundaryAfter(b, e) { return e }
+        // aos-cx base MAC 3810f0-7ade00
+        if profile.macSixHexGroups,
+           let e1 = hexRun(s, 6), e1 < b.count, b[e1] == 0x2D,
+           let e2 = hexRun(e1 + 1, 6), boundaryAfter(b, e2) {
+            return e2
+        }
         return nil
     }
 
@@ -564,7 +581,12 @@ nonisolated enum HighlightScanner {
         return nil
     }
 
-    /// (?<![0-9A-Fa-f:])(?:[0-9A-Fa-f]{0,4}:){2,7}[0-9A-Fa-f]{0,4}(?![0-9A-Fa-f:])
+    /// (?<![0-9A-Fa-f:])(?=[0-9A-Fa-f:]*::|(?:[0-9A-Fa-f]{1,4}:){7}[0-9A-Fa-f]{1,4}(?![0-9A-Fa-f:]))(?:[0-9A-Fa-f]{0,4}:){2,7}[0-9A-Fa-f]{0,4}(?![0-9A-Fa-f:])
+    ///
+    /// The shape alone (2-7 colons, 0-4 hex per group) also fits a clock, so
+    /// every `14:37:24` in `show events` / `show logging` came out address
+    /// blue; a run is only an address if it is compressed (`::` anywhere) or
+    /// spelled in full (7 colons, all 8 groups non-empty).
     static func matchIPv6(_ b: [UInt8], _ s: Int) -> Int? {
         if s > 0, isHex(b[s - 1]) || b[s - 1] == 0x3A { return nil } // lookbehind
         // Parse colon-terminated groups greedily: 0-4 hex then ':'.
@@ -586,12 +608,33 @@ nonisolated enum HighlightScanner {
             var take = min(hexEnd - afterGroups, 4)
             while take >= 0 {
                 let end = afterGroups + take
-                if end == b.count || !(isHex(b[end]) || b[end] == 0x3A) { return end }
+                if end == b.count || !(isHex(b[end]) || b[end] == 0x3A) {
+                    return isAddressShaped(b, s, end, groupEnds, k, take) ? end : nil
+                }
                 take -= 1
             }
             k -= 1
         }
         return nil
+    }
+
+    /// The extra condition the regex spells as a lookahead: `::` somewhere in
+    /// the run, or exactly 8 non-empty groups. The body can only end where a
+    /// non-hex/non-colon byte follows, so the match always covers the whole
+    /// maximal hex/colon run — a `::` anywhere in `s..<end` is inside it.
+    private static func isAddressShaped(
+        _ b: [UInt8], _ s: Int, _ end: Int, _ groupEnds: [Int], _ k: Int, _ take: Int
+    ) -> Bool {
+        if end - s >= 2 {
+            for i in s..<(end - 1) where b[i] == 0x3A && b[i + 1] == 0x3A { return true }
+        }
+        guard k == 7, take >= 1 else { return false }
+        var groupStart = s
+        for i in 0..<k {
+            guard groupEnds[i] - 1 > groupStart else { return false } // empty group
+            groupStart = groupEnds[i]
+        }
+        return true
     }
 
     static let shutdownBytes = Array("shutdown".utf8)
@@ -653,6 +696,19 @@ nonisolated extension HighlightScanner {
         /// Huawei/Comware board, AP and optical-module states.
         static let vrpGood = ["normal", "online"]
         static let vrpBad = ["abnormal", "offline", "fault", "faulty"]
+        /// AOS-CX columns and event severities. `ok` is the Reason column of
+        /// `show vlan` and the Status of `show environment fan|power-supply`;
+        /// `normal` is the temperature Status and a transceiver's `Status:
+        /// Normal`. `admin_down` has to be its own word because `_` is a word
+        /// char — `\bdown\b` can never reach the tail of it. The VSX/NTP pairs
+        /// carry their `-` the same way `err-disabled` does.
+        static let cxGood = ["ok", "normal", "in-sync", "synchronized"]
+        static let cxBad = ["fault", "faulty", "admin_down", "out-of-sync", "unsynchronized"]
+        /// `show events` severities. LOG_INFO and LOG_DEBUG stay plain: a
+        /// normal events dump is nearly all of them, and colouring the routine
+        /// line is how a severity column stops meaning anything.
+        static let cxWarn = ["warning", "warn", "log_warn"]
+        static let cxSevereBad = ["log_err", "log_crit", "log_alert", "log_emer"]
 
         static let cisco = ["GigabitEthernet", "TenGigabitEthernet", "TwoGigabitEthernet",
                             "TwentyFiveGigE", "FortyGigabitEthernet", "HundredGigE",
@@ -715,9 +771,12 @@ nonisolated extension HighlightScanner {
         ),
         "arubaCX": Profile(
             interface: Vocab.arubaCX,
-            stateGood: Vocab.goodCore + Vocab.policyGood,
-            stateBad: Vocab.badCore + Vocab.policyBad + Vocab.switchBad,
-            negations: ["no"]
+            stateGood: Vocab.goodCore + Vocab.policyGood + Vocab.cxGood,
+            stateBad: Vocab.badCore + Vocab.policyBad + Vocab.switchBad
+                + Vocab.cxBad + Vocab.cxSevereBad,
+            stateWarn: Vocab.cxWarn,
+            negations: ["no"],
+            macSixHexGroups: true
         ),
         "arubaOS": Profile(
             interface: Vocab.arubaOS,
@@ -778,10 +837,13 @@ nonisolated extension HighlightScanner {
                 + Vocab.comware + Vocab.juniper + Vocab.panos + Vocab.fortios
                 + Vocab.gaia + Vocab.linux,
             bare: ["internal", "modem", "Mgmt", "Sync", "dmz", "mgt", "lo"],
-            stateGood: Vocab.goodCore + Vocab.policyGood + Vocab.vrpGood,
-            stateBad: Vocab.badCore + Vocab.policyBad + Vocab.switchBad + Vocab.vrpBad,
+            stateGood: Vocab.goodCore + Vocab.policyGood + Vocab.vrpGood + Vocab.cxGood,
+            stateBad: Vocab.badCore + Vocab.policyBad + Vocab.switchBad + Vocab.vrpBad
+                + Vocab.cxBad + Vocab.cxSevereBad,
+            stateWarn: Vocab.cxWarn,
             negations: ["no", "undo"],
-            digitSpeedPorts: true, vlanRanges: true, macDashGroups: true
+            digitSpeedPorts: true, vlanRanges: true, macDashGroups: true,
+            macSixHexGroups: true
         ),
         "linux": Profile(
             interface: Vocab.linux, bare: ["lo"],

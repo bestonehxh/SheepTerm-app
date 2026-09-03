@@ -5,3 +5,4 @@ DerivedData/
 Builds/
 tests-scratch/
 .build/
+.claude/settings.local.json

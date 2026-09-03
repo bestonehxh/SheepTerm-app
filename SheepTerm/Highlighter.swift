@@ -281,12 +281,12 @@ nonisolated enum Highlighter {
         }
         if uses(.mask) {
             out.append(HighlightRuleConfig(
-                name: "mask", pattern: #"\b255(?:\.\d{1,3}){3}\b"#, colorHex: "B39DE8"
+                name: "mask", pattern: #"\b255(?:\.\d{1,3}){3}\b"#, colorHex: "C678DD"
             ))
         }
         if uses(.cidr) {
             out.append(HighlightRuleConfig(
-                name: "cidr", pattern: #"(?<=[.:]\d{1,3})/\d{1,2}\b"#, colorHex: "B39DE8"
+                name: "cidr", pattern: #"(?<=[.:]\d{1,3})/\d{1,2}\b"#, colorHex: "C678DD"
             ))
         }
         // Octets are capped at 255 so "999.999.999.999" no longer matches.
@@ -302,20 +302,37 @@ nonisolated enum Highlighter {
             // "1234-5678-9012"-shaped token, so only families that print MACs
             // that way carry it.
             let group = p.macDashGroups ? #"[.\-]"# : #"\."#
+            // AOS-CX writes the chassis base MAC as two 6-hex groups
+            // (3810f0-7ade00). Last alternative, and the scanner tries its
+            // branches in this same order.
+            let sixHex = p.macSixHexGroups
+                ? #"|\b[0-9A-Fa-f]{6}\-[0-9A-Fa-f]{6}\b"#
+                : ""
             out.append(HighlightRuleConfig(
                 name: "mac",
                 pattern: #"\b(?:[0-9A-Fa-f]{4}"# + group + #"){2}[0-9A-Fa-f]{4}\b"#
-                    + #"|\b(?:[0-9A-Fa-f]{2}[:\-]){5}[0-9A-Fa-f]{2}\b"#,
+                    + #"|\b(?:[0-9A-Fa-f]{2}[:\-]){5}[0-9A-Fa-f]{2}\b"# + sixHex,
                 colorHex: "E08BC7"
             ))
         }
         // Empty groups allow the compressed "::" form (2001:db8::1). Custom
         // boundaries instead of \b so a leading "::" (e.g. ::1) also matches —
         // ":" is a non-word char, so \b would never fire before it.
+        //
+        // The leading lookahead is what keeps clocks out of it: that shape on
+        // its own also fits `14:37:24`, so every timestamp in `show events` /
+        // `show logging` used to be painted address blue. A run counts as an
+        // address only if it is compressed (a `::` anywhere in it) or written
+        // out in full (7 colons, all 8 groups non-empty). The body can only
+        // end where a non-hex/non-colon byte follows, so it always spans the
+        // whole maximal hex/colon run — a `::` the lookahead finds in that run
+        // is therefore inside the match.
         if uses(.ipv6) {
             out.append(HighlightRuleConfig(
                 name: "ipv6",
-                pattern: #"(?<![0-9A-Fa-f:])(?:[0-9A-Fa-f]{0,4}:){2,7}[0-9A-Fa-f]{0,4}(?![0-9A-Fa-f:])"#,
+                pattern: #"(?<![0-9A-Fa-f:])"#
+                    + #"(?=[0-9A-Fa-f:]*::|(?:[0-9A-Fa-f]{1,4}:){7}[0-9A-Fa-f]{1,4}(?![0-9A-Fa-f:]))"#
+                    + #"(?:[0-9A-Fa-f]{0,4}:){2,7}[0-9A-Fa-f]{0,4}(?![0-9A-Fa-f:])"#,
                 colorHex: "6CD1E0"
             ))
         }
