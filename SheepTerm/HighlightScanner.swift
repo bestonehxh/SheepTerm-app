@@ -720,7 +720,9 @@ nonisolated extension HighlightScanner {
         static let arubaOS = ["GigabitEthernet", "FastEthernet", "Port-channel", "Loopback",
                               "Tunnel", "Vlan", "Trk", "Gi", "Fa", "Po", "Lo", "mgmt"]
         static let huawei = ["GigabitEthernet", "XGigabitEthernet", "M-GigabitEthernet",
-                             "Virtual-Template", "Eth-Trunk", "Stack-Port", "LoopBack",
+                             // `MultiGE` is the S5736/CloudEngine multi-gig port; `MTIGE` is how
+                             // `display vlan` abbreviates it (seen on a real S5736-S24UM4XC console).
+                             "MultiGE", "MTIGE", "Virtual-Template", "Eth-Trunk", "Stack-Port", "LoopBack",
                              "Vlanif", "Ethernet", "Tunnel", "Serial", "MEth", "NULL",
                              "Vlan", "Aux", "Pos", "GE", "XGE", "FGE", "HGE"]
         static let comware = ["Ten-GigabitEthernet", "Twenty-FiveGigE", "Hundred-GigE",
@@ -910,8 +912,17 @@ struct VendorFingerprint {
             (.cisco, s(["cisco ios software", "ios-xe", "nx-os", "cisco nexus",
                         "cisco adaptive security"])),
             (.comware, s(["comware software", "h3c comware", "hpe comware"])),
+            // The first three come from `display version` / the login banner.
+            // But a session that goes straight to `display current-configuration`
+            // never prints "Huawei" or "VRP" — its config opens with
+            // `!Software Version V200R0xxC00SPCxxx` (Comware says ` version 7.1`,
+            // AOS-CX `!Version AOS-CX`), so that header is the config signal.
+            // `vlanif` is the VRP SVI name (Comware: Vlan-interface) and shows in
+            // the config, `display ip interface brief` and every link-state log;
+            // `%%01` opens every VRP syslog line, which is all a console shows
+            // after a reboot. All three are unique across the captured corpus.
             (.huawei, s(["huawei versatile routing platform", "vrp (r)",
-                         "huawei technologies"])),
+                         "huawei technologies", "!software version v", "vlanif", "%%01"])),
             // `aruba operating system`/`arubaos (` catch `show version`;
             // `[mynode]` is the Mobility Master node-path shown in EVERY
             // prompt, so a controller session that never runs show version
